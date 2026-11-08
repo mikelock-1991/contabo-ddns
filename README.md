@@ -146,3 +146,7 @@ cargo install cargo-llvm-cov --locked
 cargo install cargo-audit --locked
 cargo audit
 ```
+
+---
+
+Powered by https://ml-engineering.nl
