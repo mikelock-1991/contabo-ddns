@@ -144,5 +144,9 @@ cargo install cargo-llvm-cov --locked
 
 ```sh
 cargo install cargo-audit --locked
+
+---
+
+Powered by https://ml-engineering.nl
 cargo audit
 ```
