@@ -67,7 +67,7 @@ jobs:
         if: github.ref_name == 'dev'
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: '1.99'
+          toolchain: '1.99.1'
 
       - name: Install cargo-edit
         if: github.ref_name == 'dev'

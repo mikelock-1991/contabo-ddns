@@ -28,7 +28,7 @@ concurrency:
 
 jobs:
   update-deps:
-    name: Update Cargo dependencies
+    name: Update dependencies
     runs-on: ubuntu-latest
     steps:
       - name: Create pipeline app token
@@ -48,7 +48,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: '1.99'
+          toolchain: '1.99.1'
           components: clippy, rustfmt, llvm-tools-preview
 
       - name: Install Cargo tools
@@ -84,7 +84,82 @@ jobs:
             cargo upgrade --pinned
           fi
 
-          if git diff --quiet --exit-code -- Cargo.toml Cargo.lock; then
+          # Pin the builder to the newest stable Rust and the digest of its -alpine image.
+          rust_version="$(curl -fsSL "https://static.rust-lang.org/dist/channel-rust-stable.toml" | awk '
+            $0 == "[pkg.rust]" { in_rust = 1; next }
+            in_rust && /^version = / { gsub(/"/, "", $3); print $3; exit }
+            in_rust && /^\[/ { exit }
+          ')"
+          if ! [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected Rust version: ${rust_version:-empty}"
+            exit 1
+          fi
+          token="$(curl -fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/rust:pull" | jq -r '.token')"
+          rust_digest="$(curl -fsSL -D - -o /dev/null \
+            -H "Authorization: Bearer ${token}" \
+            -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
+            "https://registry-1.docker.io/v2/library/rust/manifests/${rust_version}-alpine" \
+            | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:" { print $2; exit }')"
+          if ! [[ "$rust_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Unexpected Rust image digest: ${rust_digest:-empty}"
+            exit 1
+          fi
+          rust_pinned="${rust_version}-alpine@${rust_digest}"
+          rust_current="$(sed -n 's/^FROM rust:\([^ ]*\).*/\1/p' Dockerfile | head -1)"
+          rust_changed=false
+          if [ "$rust_current" = "$rust_pinned" ]; then
+            echo "Rust builder already pinned to ${rust_pinned}."
+          else
+            echo "Rust builder ${rust_current:-unpinned} -> ${rust_pinned}"
+            printf '\n## Rust\n\n- builder `%s` -> `%s`\n' "${rust_current:-unpinned}" "$rust_pinned" >> "$report_file"
+            sed -i "s|^FROM rust:.*|FROM rust:${rust_pinned} AS builder|" Dockerfile
+            rust_changed=true
+          fi
+          for workflow in .github/workflows/ci.yml .github/workflows/deploy.yml .github/workflows/dependency-updates.yml; do
+            workflow_toolchain="$(sed -n "s/.*toolchain: ['\"]\([0-9][0-9.]*\)['\"].*/\1/p" "$workflow" | head -1)"
+            if [ -z "$workflow_toolchain" ] || [ "$workflow_toolchain" = "$rust_version" ]; then
+              continue
+            fi
+            echo "Rust toolchain in ${workflow}: ${workflow_toolchain} -> ${rust_version}"
+            if [ "$rust_changed" = false ]; then
+              printf '\n## Rust\n\n' >> "$report_file"
+            fi
+            printf -- '- `%s` toolchain `%s` -> `%s`\n' "$workflow" "$workflow_toolchain" "$rust_version" >> "$report_file"
+            sed -i -E "s/(toolchain: ['\"])[0-9]+\\.[0-9]+\\.[0-9]+(['\"])/\\1${rust_version}\\2/" "$workflow"
+            rust_changed=true
+          done
+
+          # Pin the runtime image to the newest Alpine x.y.z and the digest of that tag.
+          # The tag name keeps the Dockerfile readable. The digest keeps the build reproducible.
+          alpine_version="$(curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml" | awk '/^  version: / { print $2; exit }')"
+          if ! [[ "$alpine_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected Alpine version: ${alpine_version:-empty}"
+            exit 1
+          fi
+          token="$(curl -fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/alpine:pull" | jq -r '.token')"
+          alpine_digest="$(curl -fsSL -D - -o /dev/null \
+            -H "Authorization: Bearer ${token}" \
+            -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
+            "https://registry-1.docker.io/v2/library/alpine/manifests/${alpine_version}" \
+            | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:" { print $2; exit }')"
+          if ! [[ "$alpine_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Unexpected Alpine digest: ${alpine_digest:-empty}"
+            exit 1
+          fi
+          current="$(sed -n 's/^FROM alpine://p' Dockerfile | head -1)"
+          pinned="${alpine_version}@${alpine_digest}"
+          if [ "$current" = "$pinned" ]; then
+            echo "Alpine runtime already pinned to ${pinned}."
+          else
+            echo "Alpine runtime ${current:-unpinned} -> ${pinned}"
+            printf '\n## Alpine runtime\n\n- `%s` -> `%s`\n' "${current:-unpinned}" "$pinned" >> "$report_file"
+            sed -i "s|^FROM alpine:.*|FROM alpine:${pinned}|" Dockerfile
+          fi
+
+          echo "rust_version=${rust_version}" >> "$GITHUB_OUTPUT"
+          echo "rust_changed=${rust_changed}" >> "$GITHUB_OUTPUT"
+
+          if git diff --quiet --exit-code -- Cargo.toml Cargo.lock Dockerfile .github/workflows/ci.yml .github/workflows/deploy.yml .github/workflows/dependency-updates.yml; then
             echo "No dependency updates available."
             echo "status=success" >> "$GITHUB_OUTPUT"
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
@@ -104,6 +179,13 @@ jobs:
         if: steps.apply-updates.outputs.has_changes != 'true' && steps.apply-updates.outputs.status == 'success'
         run: cargo audit
 
+      - name: Install updated Rust toolchain
+        if: steps.apply-updates.outputs.has_changes == 'true' && steps.apply-updates.outputs.rust_changed == 'true'
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.apply-updates.outputs.rust_version }}
+          components: clippy, rustfmt, llvm-tools-preview
+
       - name: Format, lint, and coverage
         if: steps.apply-updates.outputs.has_changes == 'true'
         run: |
@@ -118,7 +200,7 @@ jobs:
         run: |
           git config user.name "${APP_SLUG}[bot]"
           git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
+          git add Cargo.toml Cargo.lock Dockerfile .github/workflows/ci.yml .github/workflows/deploy.yml .github/workflows/dependency-updates.yml
           if git diff --staged --quiet; then
             echo "No dependency changes to commit."
             exit 0
@@ -135,6 +217,10 @@ jobs:
           add-paths: |
             Cargo.toml
             Cargo.lock
+            Dockerfile
+            .github/workflows/ci.yml
+            .github/workflows/deploy.yml
+            .github/workflows/dependency-updates.yml
           commit-message: |
             chore: update dependencies (automated, major)
           title: 'chore: update dependencies (major)'
