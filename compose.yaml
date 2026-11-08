@@ -1,0 +1,22 @@
+services:
+  contabo-sync:
+    init: true
+    build: .
+    image: contabo-sync
+    env_file:
+      - .env
+    environment:
+      LOG_DIR: /var/log/contabo-sync
+    volumes:
+      - contabo-sync-logs:/var/log/contabo-sync
+    restart: unless-stopped
+    # Longer than one 30s HTTP timeout, so a stop during a request still exits cleanly.
+    stop_grace_period: 45s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  contabo-sync-logs:

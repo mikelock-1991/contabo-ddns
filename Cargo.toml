@@ -1,0 +1,20 @@
+[package]
+name = "contabo-sync"
+version = "0.1.0"
+edition = "2021"
+description = "Update Contabo DNS A records and firewall source IPs"
+publish = false
+
+[dependencies]
+flexi_logger = "=0.29.8"
+log = "=0.4.22"
+reqwest = { version = "=0.12.24", default-features = false, features = ["blocking", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
+serde = { version = "=1.0.217", features = ["derive"] }
+serde_json = "=1.0.138"
+signal-hook = "=0.3.18"
+uuid = { version = "=1.11.0", features = ["v4"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
