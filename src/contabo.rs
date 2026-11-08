@@ -1,8 +1,8 @@
 //! Blocking HTTP trait, reqwest client, and authenticated Contabo JSON API.
 
 use std::fmt::Write as _;
-use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
@@ -343,12 +343,11 @@ impl<'a> ContaboClient<'a> {
 
     fn access_token(&self, force: bool) -> Result<String, Error> {
         let mut guard = self.lock_token();
-        if !force {
-            if let Some(token) = guard.as_ref() {
-                if Instant::now() < token.refresh_at {
-                    return Ok(token.access_token.clone());
-                }
-            }
+        if !force
+            && let Some(token) = guard.as_ref()
+            && Instant::now() < token.refresh_at
+        {
+            return Ok(token.access_token.clone());
         }
         log::debug!("requesting access token");
         let fresh = self.fetch_token()?;
@@ -459,7 +458,7 @@ fn snippet(body: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_http::{client, Scripted, Sequence, TOKEN_BODY};
+    use crate::test_http::{Scripted, Sequence, TOKEN_BODY, client};
     use std::sync::Mutex;
 
     #[test]
@@ -478,9 +477,10 @@ mod tests {
     fn failed_token_refresh_after_unauthorized_is_an_error() {
         let http = Sequence::in_order(&[(200, TOKEN_BODY), (401, "expired"), (403, "denied")]);
         let err = client(&http).get_json("/v1/x").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("token request failed with status 403"));
+        assert!(
+            err.to_string()
+                .contains("token request failed with status 403")
+        );
     }
 
     #[test]
@@ -542,14 +542,18 @@ mod tests {
                     .count(),
                 1
             );
-            assert!(calls[1]
-                .headers
-                .iter()
-                .any(|(name, value)| name == "authorization" && value == "Bearer tok"));
-            assert!(calls[1]
-                .headers
-                .iter()
-                .any(|(name, _)| name == "x-request-id"));
+            assert!(
+                calls[1]
+                    .headers
+                    .iter()
+                    .any(|(name, value)| name == "authorization" && value == "Bearer tok")
+            );
+            assert!(
+                calls[1]
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name == "x-request-id")
+            );
         }
         api.list("/v1/dns/zones").unwrap();
         let calls = http.calls.lock().unwrap();
@@ -600,10 +604,11 @@ mod tests {
             ("PUT", "/v1/firewalls/fw-1", 200, ""),
         ]);
         let api = client(&http);
-        assert!(api
-            .put_json("/v1/firewalls/fw-1", &json!({}))
-            .unwrap()
-            .is_null());
+        assert!(
+            api.put_json("/v1/firewalls/fw-1", &json!({}))
+                .unwrap()
+                .is_null()
+        );
     }
 
     #[test]
@@ -717,17 +722,19 @@ mod tests {
             ),
         ]);
         let api = client(&http);
-        assert!(api
-            .post_json("/v1/dns/zones/example.com/records", &json!({"type": "A"}))
-            .unwrap()
-            .is_null());
-        assert!(api
-            .patch_json(
+        assert!(
+            api.post_json("/v1/dns/zones/example.com/records", &json!({"type": "A"}))
+                .unwrap()
+                .is_null()
+        );
+        assert!(
+            api.patch_json(
                 "/v1/dns/zones/example.com/records/9",
                 &json!({"data": "1.1.1.1"})
             )
             .unwrap()
-            .is_null());
+            .is_null()
+        );
         assert_eq!(api.list("/v1/dns/zones").unwrap().len(), 1);
     }
 
@@ -924,11 +931,13 @@ mod tests {
         assert!(client(&http).list("/v1/dns/zones").unwrap().is_empty());
 
         let http = Scripted::new(vec![("POST", "/token", 200, "{}")]);
-        assert!(client(&http)
-            .get_json("/v1/dns/zones")
-            .unwrap_err()
-            .to_string()
-            .contains("access_token"));
+        assert!(
+            client(&http)
+                .get_json("/v1/dns/zones")
+                .unwrap_err()
+                .to_string()
+                .contains("access_token")
+        );
 
         let http = Scripted::new(Vec::<(&str, &str, u16, &str)>::new());
         assert!(client(&http).get_json("/v1/dns/zones").is_err());

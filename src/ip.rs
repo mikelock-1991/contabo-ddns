@@ -24,10 +24,10 @@ pub(crate) fn ipv4_from_addresses(
 ) -> Result<Vec<Ipv4Addr>, Error> {
     let mut found = Vec::new();
     for address in addresses {
-        if let IpAddr::V4(ip) = address.ip() {
-            if !found.contains(&ip) {
-                found.push(ip);
-            }
+        if let IpAddr::V4(ip) = address.ip()
+            && !found.contains(&ip)
+        {
+            found.push(ip);
         }
     }
     if found.is_empty() {
@@ -346,11 +346,13 @@ mod tests {
         let resolver = SystemResolver;
         let ips = resolver.lookup_v4("127.0.0.1").unwrap();
         assert!(ips.iter().any(|ip| ip.is_loopback()));
-        assert!(resolver
-            .lookup_v4("[")
-            .unwrap_err()
-            .to_string()
-            .contains("resolve"));
+        assert!(
+            resolver
+                .lookup_v4("[")
+                .unwrap_err()
+                .to_string()
+                .contains("resolve")
+        );
 
         use std::net::{Ipv6Addr, SocketAddr};
         let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
@@ -358,17 +360,21 @@ mod tests {
             ipv4_from_addresses("dup", vec![v4, v4]).unwrap(),
             vec![Ipv4Addr::LOCALHOST]
         );
-        assert!(ipv4_from_addresses(
-            "ipv6-only",
-            vec![SocketAddr::from((Ipv6Addr::LOCALHOST, 0))]
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("no A record"));
-        assert!(resolve_sources(&["gap.example".into()], None, &EmptyList)
+        assert!(
+            ipv4_from_addresses(
+                "ipv6-only",
+                vec![SocketAddr::from((Ipv6Addr::LOCALHOST, 0))]
+            )
             .unwrap_err()
             .to_string()
-            .contains("empty"));
+            .contains("no A record")
+        );
+        assert!(
+            resolve_sources(&["gap.example".into()], None, &EmptyList)
+                .unwrap_err()
+                .to_string()
+                .contains("empty")
+        );
     }
 
     #[test]
@@ -398,14 +404,16 @@ mod tests {
             status: 503,
             calls: Mutex::new(0),
         };
-        assert!(fetch_public_ip(
-            &http,
-            &["https://ipecho.test/plain".into()],
-            Duration::from_secs(10),
-            &NO_SHUTDOWN,
-            crate::retry::immediate,
-        )
-        .is_err());
+        assert!(
+            fetch_public_ip(
+                &http,
+                &["https://ipecho.test/plain".into()],
+                Duration::from_secs(10),
+                &NO_SHUTDOWN,
+                crate::retry::immediate,
+            )
+            .is_err()
+        );
         assert!(*http.calls.lock().unwrap() >= 2);
     }
 
@@ -438,14 +446,16 @@ mod tests {
         assert!(!is_publishable(Ipv4Addr::new(255, 255, 255, 255)));
         assert!(!is_publishable(Ipv4Addr::new(224, 0, 0, 1)));
         assert!(is_publishable(Ipv4Addr::new(1, 1, 1, 1)));
-        assert!(fetch_public_ip(
-            &ByUrl,
-            &[],
-            Duration::from_secs(1),
-            &NO_SHUTDOWN,
-            crate::retry::immediate,
-        )
-        .is_err());
+        assert!(
+            fetch_public_ip(
+                &ByUrl,
+                &[],
+                Duration::from_secs(1),
+                &NO_SHUTDOWN,
+                crate::retry::immediate,
+            )
+            .is_err()
+        );
         let ip = fetch_public_ip(
             &ByUrl,
             &[

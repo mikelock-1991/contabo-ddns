@@ -4,12 +4,12 @@ use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::FirewallConfig;
-use crate::contabo::{encode_path_segment, ContaboClient};
+use crate::contabo::{ContaboClient, encode_path_segment};
 use crate::error::Error;
-use crate::ip::{resolve_sources, Resolver};
+use crate::ip::{Resolver, resolve_sources};
 
 /// Remembers a firewall id looked up by name for the life of the process.
 pub struct FirewallState {
@@ -238,7 +238,7 @@ mod tests {
     use super::*;
     use crate::config::FirewallRuleConfig;
     use crate::ip::MapResolver;
-    use crate::test_http::{client, token_route, Scripted, Sequence, TOKEN_BODY};
+    use crate::test_http::{Scripted, Sequence, TOKEN_BODY, client, token_route};
     use std::net::Ipv4Addr;
 
     fn sample_firewall() -> String {
@@ -306,26 +306,29 @@ mod tests {
             &FirewallState::new(),
         )
         .unwrap();
-        assert!(http
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|call| call.method == "PUT"));
+        assert!(
+            http.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.method == "PUT")
+        );
         let denied = Scripted::new(vec![
             token_route(),
             ("GET", "/v1/firewalls/fw-1", 200, sample_firewall()),
             ("PUT", "/v1/firewalls/fw-1", 400, "no".into()),
         ]);
-        assert!(sync(
-            &client(&denied),
-            &cfg(vec!["203.0.113.5"]),
-            None,
-            &resolver(),
-            false,
-            &FirewallState::new(),
-        )
-        .is_err());
+        assert!(
+            sync(
+                &client(&denied),
+                &cfg(vec!["203.0.113.5"]),
+                None,
+                &resolver(),
+                false,
+                &FirewallState::new(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -539,15 +542,17 @@ mod tests {
             let mut named = cfg(vec!["1.1.1.1"]);
             named.id = None;
             named.name = Some("edge".into());
-            assert!(sync(
-                &client(&http),
-                &named,
-                None,
-                &resolver(),
-                false,
-                &FirewallState::new(),
-            )
-            .is_err());
+            assert!(
+                sync(
+                    &client(&http),
+                    &named,
+                    None,
+                    &resolver(),
+                    false,
+                    &FirewallState::new(),
+                )
+                .is_err()
+            );
         }
     }
 
@@ -637,30 +642,34 @@ mod tests {
             token_route(),
             ("GET", "/v1/firewalls/fw-1", 200, bad_ipv4.into()),
         ]);
-        assert!(sync(
-            &client(&http),
-            &cfg(vec!["203.0.113.5"]),
-            None,
-            &resolver(),
-            false,
-            &FirewallState::new(),
-        )
-        .is_err());
+        assert!(
+            sync(
+                &client(&http),
+                &cfg(vec!["203.0.113.5"]),
+                None,
+                &resolver(),
+                false,
+                &FirewallState::new(),
+            )
+            .is_err()
+        );
 
         let bad_rule = r#"{"data":[{"firewallId":"fw-1","rules":{"inbound":["x"]}}]}"#;
         let http = Scripted::new(vec![
             token_route(),
             ("GET", "/v1/firewalls/fw-1", 200, bad_rule.into()),
         ]);
-        assert!(sync(
-            &client(&http),
-            &cfg(vec!["203.0.113.5"]),
-            None,
-            &resolver(),
-            false,
-            &FirewallState::new(),
-        )
-        .is_err());
+        assert!(
+            sync(
+                &client(&http),
+                &cfg(vec!["203.0.113.5"]),
+                None,
+                &resolver(),
+                false,
+                &FirewallState::new(),
+            )
+            .is_err()
+        );
 
         let bad_src = r#"{"data":[{"firewallId":"fw-1","rules":{"inbound":[
             {"displayName":"SSH","srcCidr":"text"}
@@ -669,49 +678,55 @@ mod tests {
             token_route(),
             ("GET", "/v1/firewalls/fw-1", 200, bad_src.into()),
         ]);
-        assert!(sync(
-            &client(&http),
-            &cfg(vec!["203.0.113.5"]),
-            None,
-            &resolver(),
-            false,
-            &FirewallState::new(),
-        )
-        .is_err());
+        assert!(
+            sync(
+                &client(&http),
+                &cfg(vec!["203.0.113.5"]),
+                None,
+                &resolver(),
+                false,
+                &FirewallState::new(),
+            )
+            .is_err()
+        );
 
         let missing = r#"{"data":[{"firewallId":"fw-1","rules":{}}]}"#;
         let http = Scripted::new(vec![
             token_route(),
             ("GET", "/v1/firewalls/fw-1", 200, missing.into()),
         ]);
-        assert!(sync(
-            &client(&http),
-            &cfg(vec!["203.0.113.5"]),
-            None,
-            &resolver(),
-            false,
-            &FirewallState::new(),
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("inbound"));
+        assert!(
+            sync(
+                &client(&http),
+                &cfg(vec!["203.0.113.5"]),
+                None,
+                &resolver(),
+                false,
+                &FirewallState::new(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("inbound")
+        );
 
         let inbound_object = r#"{"data":[{"firewallId":"fw-1","rules":{"inbound":{}}}]}"#;
         let http = Scripted::new(vec![
             token_route(),
             ("GET", "/v1/firewalls/fw-1", 200, inbound_object.into()),
         ]);
-        assert!(sync(
-            &client(&http),
-            &cfg(vec!["203.0.113.5"]),
-            None,
-            &resolver(),
-            false,
-            &FirewallState::new(),
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("inbound"));
+        assert!(
+            sync(
+                &client(&http),
+                &cfg(vec!["203.0.113.5"]),
+                None,
+                &resolver(),
+                false,
+                &FirewallState::new(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("inbound")
+        );
 
         let number_entry = r#"{"data":[{"firewallId":"fw-1","rules":{"inbound":[
             {"displayName":"SSH","srcCidr":{"ipv4":[1]}}
@@ -720,17 +735,19 @@ mod tests {
             token_route(),
             ("GET", "/v1/firewalls/fw-1", 200, number_entry.into()),
         ]);
-        assert!(sync(
-            &client(&http),
-            &cfg(vec!["203.0.113.5"]),
-            None,
-            &resolver(),
-            false,
-            &FirewallState::new(),
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("not a string"));
+        assert!(
+            sync(
+                &client(&http),
+                &cfg(vec!["203.0.113.5"]),
+                None,
+                &resolver(),
+                false,
+                &FirewallState::new(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("not a string")
+        );
 
         let no_src = r#"{"data":[{"firewallId":"fw-1","rules":{"inbound":[
             {"displayName":"SSH","protocol":"tcp"}
@@ -740,42 +757,48 @@ mod tests {
             ("GET", "/v1/firewalls/fw-1", 200, no_src.into()),
             ("PUT", "/v1/firewalls/fw-1", 200, r#"{"data":[]}"#.into()),
         ]);
-        assert!(sync(
-            &client(&http),
-            &cfg(vec!["203.0.113.5"]),
-            None,
-            &resolver(),
-            false,
-            &FirewallState::new(),
-        )
-        .is_ok());
+        assert!(
+            sync(
+                &client(&http),
+                &cfg(vec!["203.0.113.5"]),
+                None,
+                &resolver(),
+                false,
+                &FirewallState::new(),
+            )
+            .is_ok()
+        );
 
         assert!(set_ipv4(&mut json!("nope"), &["203.0.113.5".into()]).is_err());
         let http = Scripted::new(vec![token_route(), ("GET", "name=edge", 400, "no".into())]);
         let mut named = cfg(vec!["203.0.113.5"]);
         named.id = None;
         named.name = Some("edge".into());
-        assert!(sync(
-            &client(&http),
-            &named,
-            None,
-            &resolver(),
-            false,
-            &FirewallState::new()
-        )
-        .is_err());
+        assert!(
+            sync(
+                &client(&http),
+                &named,
+                None,
+                &resolver(),
+                false,
+                &FirewallState::new()
+            )
+            .is_err()
+        );
 
         let http = Scripted::new(vec![token_route()]);
-        assert!(sync(
-            &client(&http),
-            &cfg(vec!["203.0.113.5"]),
-            None,
-            &resolver(),
-            false,
-            &FirewallState::new(),
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("unexpected"));
+        assert!(
+            sync(
+                &client(&http),
+                &cfg(vec!["203.0.113.5"]),
+                None,
+                &resolver(),
+                false,
+                &FirewallState::new(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected")
+        );
     }
 }

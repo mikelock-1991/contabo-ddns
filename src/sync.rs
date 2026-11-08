@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::contabo::ContaboClient;
 use crate::error::Error;
 use crate::firewall::FirewallState;
-use crate::ip::{fetch_public_ip, Resolver};
+use crate::ip::{Resolver, fetch_public_ip};
 
 /// Fetches the public IP when needed, then runs DNS and firewall sync on threads.
 ///
@@ -68,15 +68,15 @@ pub fn run_cycle(
                 crate::firewall::sync(client, firewall, ip, resolver, cfg.dry_run, firewall_state)
             })
         });
-        if let Some(job) = dns_job {
-            if let Err(err) = join_job(job.join(), "dns") {
-                errors.push(err.to_string());
-            }
+        if let Some(job) = dns_job
+            && let Err(err) = join_job(job.join(), "dns")
+        {
+            errors.push(err.to_string());
         }
-        if let Some(job) = firewall_job {
-            if let Err(err) = join_job(job.join(), "firewall") {
-                errors.push(err.to_string());
-            }
+        if let Some(job) = firewall_job
+            && let Err(err) = join_job(job.join(), "firewall")
+        {
+            errors.push(err.to_string());
         }
     });
     if errors.is_empty() {
@@ -258,8 +258,8 @@ mod tests {
         let err = run_cycle(&cfg, &api(&cfg, &http), &resolver, &FirewallState::new()).unwrap_err();
         assert!(err.to_string().contains("dns list down"));
         assert!(err.to_string().contains("firewall read down"));
-        assert!(http
-            .send(&HttpRequest {
+        assert!(
+            http.send(&HttpRequest {
                 method: "PATCH".into(),
                 url: "https://api.example.test/leftover".into(),
                 headers: vec![],
@@ -269,20 +269,25 @@ mod tests {
             })
             .unwrap_err()
             .to_string()
-            .contains("unexpected"));
+            .contains("unexpected")
+        );
     }
 
     #[test]
     fn join_job_maps_panic_and_inner_error() {
         let panicked: std::thread::Result<Result<(), Error>> = Err(Box::new("boom"));
-        assert!(join_job(panicked, "dns")
-            .unwrap_err()
-            .to_string()
-            .contains("dns thread panicked"));
-        assert!(join_job::<()>(Ok(Err(Error::new("dns list down"))), "dns")
-            .unwrap_err()
-            .to_string()
-            .contains("dns list down"));
+        assert!(
+            join_job(panicked, "dns")
+                .unwrap_err()
+                .to_string()
+                .contains("dns thread panicked")
+        );
+        assert!(
+            join_job::<()>(Ok(Err(Error::new("dns list down"))), "dns")
+                .unwrap_err()
+                .to_string()
+                .contains("dns list down")
+        );
         join_job::<()>(Ok(Ok(())), "dns").unwrap();
     }
 
@@ -316,8 +321,8 @@ mod tests {
             assert!(calls.iter().all(|url| !url.contains("ipecho")));
         }
         assert!(cfg.ip_echo_timeout == Duration::from_secs(10));
-        assert!(http
-            .send(&HttpRequest {
+        assert!(
+            http.send(&HttpRequest {
                 method: "GET".into(),
                 url: "https://ipecho.test/plain".into(),
                 headers: vec![],
@@ -327,9 +332,10 @@ mod tests {
             })
             .unwrap_err()
             .to_string()
-            .contains("ipecho"));
-        assert!(http
-            .send(&HttpRequest {
+            .contains("ipecho")
+        );
+        assert!(
+            http.send(&HttpRequest {
                 method: "PATCH".into(),
                 url: "https://api.example.test/unexpected".into(),
                 headers: vec![],
@@ -339,7 +345,8 @@ mod tests {
             })
             .unwrap_err()
             .to_string()
-            .contains("unexpected"));
+            .contains("unexpected")
+        );
     }
 
     #[test]
@@ -456,8 +463,8 @@ mod tests {
             assert!(calls.iter().all(|url| !url.contains("PUT")));
             assert!(calls.iter().all(|url| !url.contains("PATCH")));
         }
-        assert!(http
-            .send(&HttpRequest {
+        assert!(
+            http.send(&HttpRequest {
                 method: "POST".into(),
                 url: "https://api.example.test/unexpected".into(),
                 headers: vec![],
@@ -467,6 +474,7 @@ mod tests {
             })
             .unwrap_err()
             .to_string()
-            .contains("unexpected"));
+            .contains("unexpected")
+        );
     }
 }

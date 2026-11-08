@@ -18,8 +18,8 @@ mod sync;
 mod test_http;
 
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Process entry: parse env config, then start the sync loop.
