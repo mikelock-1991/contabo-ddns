@@ -2,7 +2,7 @@
 
 Container that updates Contabo DNS A records and the IPv4 sources of named firewall rules. Run it on the network whose public address should be published. On the Contabo VPS, the echo service returns the VPS address. At home, it returns the home address.
 
-The process user is uid 1000. The root filesystem is read-only, all capabilities are dropped, and `no-new-privileges` is set. The only writable path is the log directory.
+The published image is `gcr.io/distroless/static-debian13:nonroot`. The process user is uid 65532. There is no shell. The root filesystem is read-only, all capabilities are dropped, and `no-new-privileges` is set. The only writable path is the log directory.
 
 ## Configure
 
@@ -96,7 +96,7 @@ podman run --rm --env-file .env -e INTERVAL_SECONDS=0 -e LOG_DIR= \
   contabo-ddns
 ```
 
-A host bind mount must be writable by uid 1000:
+A host bind mount must be writable by uid 65532:
 
 ```sh
 podman run --rm --env-file .env -e INTERVAL_SECONDS=0 \
