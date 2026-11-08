@@ -3,10 +3,10 @@
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::{DnsConfig, DnsTarget};
-use crate::contabo::{encode_path_segment, ContaboClient};
+use crate::contabo::{ContaboClient, encode_path_segment};
 use crate::error::Error;
 
 /// TTL for created records when `DNS_TTL` is unset.
@@ -139,18 +139,18 @@ pub fn sync(
         }
     } else {
         for target in &cfg.records {
-            if let DnsTarget::Exact(host) = target {
-                if !seen.contains(host) {
-                    log::warn!("no A record for {host}");
-                }
+            if let DnsTarget::Exact(host) = target
+                && !seen.contains(host)
+            {
+                log::warn!("no A record for {host}");
             }
         }
     }
     for target in &cfg.records {
-        if let DnsTarget::Wildcard(parent) = target {
-            if !matched_targets.contains(&format!("*.{parent}")) {
-                log::warn!("wildcard *.{parent} matched no A records");
-            }
+        if let DnsTarget::Wildcard(parent) = target
+            && !matched_targets.contains(&format!("*.{parent}"))
+        {
+            log::warn!("wildcard *.{parent} matched no A records");
         }
     }
 
@@ -274,7 +274,7 @@ mod tests {
 
     use super::*;
     use crate::contabo::HttpRequest;
-    use crate::test_http::{client, token_route, Scripted};
+    use crate::test_http::{Scripted, client, token_route};
 
     fn zones(body: &str) -> (&'static str, &'static str, u16, String) {
         ("GET", "/v1/dns/zones?", 200, body.into())
@@ -409,10 +409,12 @@ mod tests {
         )
         .unwrap();
         let calls = calls_of(&http);
-        assert!(calls
-            .iter()
-            .filter(|call| call.url.contains("/records"))
-            .all(|call| call.method == "GET"));
+        assert!(
+            calls
+                .iter()
+                .filter(|call| call.url.contains("/records"))
+                .all(|call| call.method == "GET")
+        );
     }
 
     #[test]
@@ -612,10 +614,12 @@ mod tests {
         )
         .unwrap();
         let calls = calls_of(&http);
-        assert!(calls
-            .iter()
-            .filter(|call| call.url.contains("/dns/zones/") && call.url.contains("/records"))
-            .all(|call| call.method != "POST"));
+        assert!(
+            calls
+                .iter()
+                .filter(|call| call.url.contains("/dns/zones/") && call.url.contains("/records"))
+                .all(|call| call.method != "POST")
+        );
 
         let http = Scripted::new(vec![
             token_route(),

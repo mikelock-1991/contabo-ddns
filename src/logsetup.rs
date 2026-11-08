@@ -309,11 +309,13 @@ mod tests {
         let failed = finish_start(Err::<flexi_logger::LoggerHandle, &str>(
             "injected start failure",
         ));
-        assert!(failed
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("injected start failure"));
+        assert!(
+            failed
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("injected start failure")
+        );
     }
 
     #[test]

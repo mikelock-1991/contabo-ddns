@@ -445,7 +445,7 @@ fn parse_firewall(map: &HashMap<String, String>) -> Result<Option<FirewallConfig
         _ => {
             return Err(Error::new(
                 "set exactly one of FIREWALL_ID or FIREWALL_NAME",
-            ))
+            ));
         }
     }
     Ok(Some(FirewallConfig { id, name, rules }))
@@ -592,10 +592,12 @@ mod tests {
     fn rejects_missing_secret_and_idle_schedule() {
         let mut pairs = base();
         pairs.retain(|(key, _)| *key != "CONTABO_API_PASSWORD");
-        assert!(Config::from_pairs(pairs)
-            .unwrap_err()
-            .to_string()
-            .contains("CONTABO_API_PASSWORD"));
+        assert!(
+            Config::from_pairs(pairs)
+                .unwrap_err()
+                .to_string()
+                .contains("CONTABO_API_PASSWORD")
+        );
 
         let mut pairs = base();
         pairs.push(("RUN_ON_START", "false"));
@@ -604,20 +606,24 @@ mod tests {
 
         let mut pairs = base();
         pairs.push(("CONTABO_CLIENT_SECRET", "   "));
-        assert!(Config::from_pairs(pairs)
-            .unwrap_err()
-            .to_string()
-            .contains("CONTABO_CLIENT_SECRET is required"));
+        assert!(
+            Config::from_pairs(pairs)
+                .unwrap_err()
+                .to_string()
+                .contains("CONTABO_CLIENT_SECRET is required")
+        );
     }
 
     #[test]
     fn rejects_bad_names_ttl_and_tls_roots() {
         let mut pairs = base();
         pairs.push(("DNS_RECORDS", "home example.com"));
-        assert!(Config::from_pairs(pairs)
-            .unwrap_err()
-            .to_string()
-            .contains("bad DNS name"));
+        assert!(
+            Config::from_pairs(pairs)
+                .unwrap_err()
+                .to_string()
+                .contains("bad DNS name")
+        );
 
         let mut pairs = base();
         pairs.push(("DNS_RECORDS", "*.-bad.example"));
@@ -625,10 +631,12 @@ mod tests {
 
         let mut pairs = base();
         pairs.push(("DNS_TTL", "0"));
-        assert!(Config::from_pairs(pairs)
-            .unwrap_err()
-            .to_string()
-            .contains("DNS_TTL"));
+        assert!(
+            Config::from_pairs(pairs)
+                .unwrap_err()
+                .to_string()
+                .contains("DNS_TTL")
+        );
 
         let mut pairs = base();
         pairs.retain(|(key, _)| *key != "DNS_RECORDS");
@@ -638,10 +646,12 @@ mod tests {
             "FIREWALL_RULES",
             r#"[{"displayName":"SSH","sources":["10.0.0.0/24","not a host"]}]"#,
         ));
-        assert!(Config::from_pairs(pairs)
-            .unwrap_err()
-            .to_string()
-            .contains("not a host"));
+        assert!(
+            Config::from_pairs(pairs)
+                .unwrap_err()
+                .to_string()
+                .contains("not a host")
+        );
 
         let mut pairs = base();
         pairs.retain(|(key, _)| *key != "DNS_RECORDS");
@@ -664,10 +674,12 @@ mod tests {
         }
         let mut pairs = base();
         pairs.push(("TLS_ROOTS", "custom"));
-        assert!(Config::from_pairs(pairs)
-            .unwrap_err()
-            .to_string()
-            .contains("TLS_ROOTS"));
+        assert!(
+            Config::from_pairs(pairs)
+                .unwrap_err()
+                .to_string()
+                .contains("TLS_ROOTS")
+        );
     }
 
     #[test]
@@ -678,10 +690,12 @@ mod tests {
             let result = Config::from_pairs(pairs);
             assert_eq!(result.is_ok(), ok, "INTERVAL_SECONDS={value}");
             if !ok {
-                assert!(result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("must be 0 or >= 30"));
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("must be 0 or >= 30")
+                );
             }
         }
     }
@@ -702,10 +716,12 @@ mod tests {
 
         let mut pairs = base();
         pairs.push(("LOG_ROTATE_KEEP", "10001"));
-        assert!(Config::from_pairs(pairs)
-            .unwrap_err()
-            .to_string()
-            .contains("between 1 and 10000"));
+        assert!(
+            Config::from_pairs(pairs)
+                .unwrap_err()
+                .to_string()
+                .contains("between 1 and 10000")
+        );
 
         let mut pairs = base();
         pairs.push(("LOG_ROTATE_KEEP", "10000"));
@@ -713,10 +729,12 @@ mod tests {
 
         let mut pairs = base();
         pairs.push(("LOG_TO_STDOUT", "false"));
-        assert!(Config::from_pairs(pairs)
-            .unwrap_err()
-            .to_string()
-            .contains("LOG_DIR"));
+        assert!(
+            Config::from_pairs(pairs)
+                .unwrap_err()
+                .to_string()
+                .contains("LOG_DIR")
+        );
     }
 
     #[test]
@@ -754,10 +772,12 @@ mod tests {
 
         let mut pairs = base();
         pairs.push(("IP_ECHO_URL", "http://ipecho.test/plain"));
-        assert!(Config::from_pairs(pairs)
-            .unwrap_err()
-            .to_string()
-            .contains("https://"));
+        assert!(
+            Config::from_pairs(pairs)
+                .unwrap_err()
+                .to_string()
+                .contains("https://")
+        );
     }
 
     #[test]

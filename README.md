@@ -69,7 +69,9 @@ docker compose up -d --build
 
 Compose names the image `contabo-ddns`, restarts it unless it is stopped, and mounts the `contabo-ddns-logs` volume on `/var/log/contabo-ddns`. `stop_grace_period` is 45 seconds, which is longer than one 30 second HTTP timeout.
 
-A published image is `ghcr.io/mikelock-1991/contabo-ddns` and `docker.io/mikelockengineering/contabo-ddns`. `latest` tracks `main`, `beta` tracks `dev`, and each release is also tagged with the `Cargo.toml` version. The deploy workflow logs in to Docker Hub with the `DOCKERHUB_USERNAME` variable and the `DOCKERHUB_TOKEN` secret (a Docker Hub access token with write access). Set both on the repository, or on the `main` and `dev` environments. Log in first when the GitHub package is private:
+A published image is `ghcr.io/mikelock-1991/contabo-ddns` and `docker.io/mikelockengineering/contabo-ddns`. `latest` tracks `main`, `beta` tracks `dev`, and each release is also tagged with the `Cargo.toml` version. The deploy workflow logs in to Docker Hub with the `DOCKERHUB_USERNAME` variable and the `DOCKERHUB_TOKEN` secret (a Docker Hub access token with write access). Set both on the repository, or on the `main` and `dev` environments.
+
+After the image starts and exits 2 with an empty environment, the workflow creates or updates GitHub Release `v<version>` on the commit that was built. A `dev` publish stays a prerelease. A `main` publish marks that same release as the latest. The notes are regenerated on every publish from the commits since the previous version tag. The automatic patch-bump commit is omitted. Log in first when the GitHub package is private:
 
 ```sh
 podman login ghcr.io
