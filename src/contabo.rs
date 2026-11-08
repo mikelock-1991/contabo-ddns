@@ -92,7 +92,7 @@ impl ReqwestHttp {
     pub fn new(roots: crate::config::TlsRoots) -> Result<Self, Error> {
         use crate::config::TlsRoots;
         let builder = Client::builder()
-            .user_agent("contabo-sync")
+            .user_agent("contabo-ddns")
             .timeout(HTTP_TIMEOUT)
             .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
             .tls_built_in_webpki_certs(matches!(roots, TlsRoots::Both | TlsRoots::Webpki))

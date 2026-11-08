@@ -13,7 +13,7 @@ const DEFAULT_API_BASE: &str = "https://api.contabo.com";
 const DEFAULT_AUTH_URL: &str =
     "https://auth.contabo.com/auth/realms/contabo/protocol/openid-connect/token";
 const DEFAULT_IP_ECHO_URL: &str = "https://ipecho.net/plain";
-const DEFAULT_LOG_DIR: &str = "/var/log/contabo-sync";
+const DEFAULT_LOG_DIR: &str = "/var/log/contabo-ddns";
 const DEFAULT_IP_ECHO_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_INTERVAL_SECS: u64 = 300;
 /// Shortest loop interval, so a misconfiguration cannot hammer the Contabo API.
@@ -242,7 +242,7 @@ fn parse_log(map: &HashMap<String, String>) -> Result<LogConfig, Error> {
         Some(path) => Some(PathBuf::from(path)),
     };
     let file = optional(map, "LOG_FILE")
-        .unwrap_or("contabo-sync.log")
+        .unwrap_or("contabo-ddns.log")
         .trim()
         .to_string();
     if file.is_empty() || file.contains('/') || file.contains('\\') {
@@ -564,7 +564,7 @@ mod tests {
         assert!(cfg.log.to_stdout);
         assert_eq!(cfg.log.rotate_size_mb, 10);
         assert_eq!(cfg.log.rotate_keep, 5);
-        assert_eq!(cfg.log.file, "contabo-sync.log");
+        assert_eq!(cfg.log.file, "contabo-ddns.log");
         assert_eq!(cfg.tls_roots, TlsRoots::Both);
         assert_eq!(cfg.ip_echo_urls, vec![DEFAULT_IP_ECHO_URL.to_string()]);
         let dns = cfg.dns.as_ref().unwrap();

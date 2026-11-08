@@ -13,9 +13,9 @@ RUN touch src/main.rs && cargo build --release --locked
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates \
     && adduser -D -u 1000 -h /home/app app \
-    && mkdir -p /var/log/contabo-sync \
-    && chown app:app /var/log/contabo-sync
-COPY --from=builder /src/target/release/contabo-sync /usr/local/bin/contabo-sync
+    && mkdir -p /var/log/contabo-ddns \
+    && chown app:app /var/log/contabo-ddns
+COPY --from=builder /src/target/release/contabo-ddns /usr/local/bin/contabo-ddns
 USER app
-ENV LOG_DIR=/var/log/contabo-sync
-ENTRYPOINT ["contabo-sync"]
+ENV LOG_DIR=/var/log/contabo-ddns
+ENTRYPOINT ["contabo-ddns"]

@@ -107,7 +107,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "contabo-sync"
+name = "contabo-ddns"
 version = "0.1.0"
 dependencies = [
  "flexi_logger",

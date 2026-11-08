@@ -1,5 +1,5 @@
 [package]
-name = "contabo-sync"
+name = "contabo-ddns"
 version = "0.1.0"
 edition = "2021"
 description = "Update Contabo DNS A records and firewall source IPs"

@@ -55,7 +55,7 @@ fn start(cfg: config::Config, delay: fn(u32) -> Duration) -> ExitCode {
         }
     };
     log::info!(
-        "contabo-sync run_on_start={} interval_seconds={} dry_run={} dns={} firewall={}",
+        "contabo-ddns run_on_start={} interval_seconds={} dry_run={} dns={} firewall={}",
         cfg.run_on_start,
         cfg.interval_seconds,
         cfg.dry_run,
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn cfg_scanner_reports_a_nested_attribute() {
-        let dir = crate::logsetup::unique_temp("contabo-sync-cfg");
+        let dir = crate::logsetup::unique_temp("contabo-ddns-cfg");
         let nested = dir.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(dir.join("note.txt"), "ignore").unwrap();
@@ -453,7 +453,7 @@ mod tests {
     /// Bad log dir exits 2; a client build error or a failed live cycle exits 1.
     #[test]
     fn startup_from_env_and_start() {
-        let probe = crate::logsetup::unique_temp("contabo-sync-logfile");
+        let probe = crate::logsetup::unique_temp("contabo-ddns-logfile");
         let _ = std::fs::write(&probe, b"x");
         let mut bad_log = sample("0", "true");
         bad_log.log.dir = Some(probe.clone());
@@ -521,7 +521,7 @@ mod tests {
             let cfg = crate::config::Config::from_env().unwrap();
             assert_eq!(start(cfg, crate::retry::immediate), ExitCode::from(1));
         });
-        let probe = crate::logsetup::unique_temp("contabo-sync-main-log");
+        let probe = crate::logsetup::unique_temp("contabo-ddns-main-log");
         let _ = std::fs::write(&probe, b"x");
         let mut blocked = pairs;
         blocked[6].1 = probe.display().to_string();
@@ -532,7 +532,7 @@ mod tests {
         let dup = crate::config::LogConfig {
             level: "info".into(),
             dir: None,
-            file: "contabo-sync.log".into(),
+            file: "contabo-ddns.log".into(),
             rotate_size_mb: 10,
             rotate_keep: 5,
             to_stdout: true,

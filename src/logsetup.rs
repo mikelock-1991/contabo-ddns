@@ -28,7 +28,7 @@ pub fn prepare(log: &LogConfig) -> Result<Logger, Error> {
         if let Err(err) = fs::create_dir_all(dir) {
             return Err(log_dir_err(dir, "create", err));
         }
-        let probe = dir.join(".contabo-sync-write-test");
+        let probe = dir.join(".contabo-ddns-write-test");
         if let Err(err) = fs::write(&probe, b"") {
             return Err(log_dir_err(dir, "log dir not writable", err));
         }
@@ -131,7 +131,7 @@ pub(crate) fn discard_output() {
     let log = LogConfig {
         level: "info".into(),
         dir: None,
-        file: "contabo-sync.log".into(),
+        file: "contabo-ddns.log".into(),
         rotate_size_mb: 1,
         rotate_keep: 1,
         to_stdout: true,
@@ -146,7 +146,7 @@ fn finish_start(
     result.map_err(flexi_parse_err)
 }
 
-/// Splits `contabo-sync.log` into basename + suffix; missing suffix becomes `"log"`.
+/// Splits `contabo-ddns.log` into basename + suffix; missing suffix becomes `"log"`.
 pub fn split_log_file(file: &str) -> (String, String) {
     match Path::new(file)
         .file_name()
@@ -183,12 +183,12 @@ mod tests {
 
     #[test]
     fn logging_init_and_prepare_paths() {
-        let dir = unique_temp("contabo-sync-logsetup");
+        let dir = unique_temp("contabo-ddns-logsetup");
         let _ = std::fs::remove_dir_all(&dir);
         let file_log = LogConfig {
             level: "info".into(),
             dir: Some(dir.clone()),
-            file: "contabo-sync.log".into(),
+            file: "contabo-ddns.log".into(),
             rotate_size_mb: 1,
             rotate_keep: 2,
             to_stdout: true,
@@ -197,7 +197,7 @@ mod tests {
         let quiet = LogConfig {
             level: "info".into(),
             dir: Some(dir.clone()),
-            file: "contabo-sync.log".into(),
+            file: "contabo-ddns.log".into(),
             rotate_size_mb: 1,
             rotate_keep: 2,
             to_stdout: false,
@@ -206,7 +206,7 @@ mod tests {
         let bad_level = LogConfig {
             level: "crate1::mod1=wrong, crate2=warn".into(),
             dir: Some(dir.clone()),
-            file: "contabo-sync.log".into(),
+            file: "contabo-ddns.log".into(),
             rotate_size_mb: 1,
             rotate_keep: 2,
             to_stdout: false,
@@ -215,7 +215,7 @@ mod tests {
         let bad_stdout = LogConfig {
             level: "crate1::mod1=wrong, crate2=warn".into(),
             dir: None,
-            file: "contabo-sync.log".into(),
+            file: "contabo-ddns.log".into(),
             rotate_size_mb: 1,
             rotate_keep: 2,
             to_stdout: true,
@@ -225,7 +225,7 @@ mod tests {
         let stdout = LogConfig {
             level: "info".into(),
             dir: None,
-            file: "contabo-sync.log".into(),
+            file: "contabo-ddns.log".into(),
             rotate_size_mb: 1,
             rotate_keep: 2,
             to_stdout: true,
@@ -234,12 +234,12 @@ mod tests {
         assert_eq!(log_dir_label(None), "(stdout)");
         assert_eq!(log_dir_label(Some(&dir)), dir.display().to_string());
 
-        let probe = unique_temp("contabo-sync-logfile");
+        let probe = unique_temp("contabo-ddns-logfile");
         let _ = std::fs::write(&probe, b"x");
         let bad_dir = LogConfig {
             level: "info".into(),
             dir: Some(probe.clone()),
-            file: "contabo-sync.log".into(),
+            file: "contabo-ddns.log".into(),
             rotate_size_mb: 1,
             rotate_keep: 2,
             to_stdout: false,
@@ -247,11 +247,11 @@ mod tests {
         assert!(prepare(&bad_dir).is_err());
 
         let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::create_dir_all(dir.join(".contabo-sync-write-test"));
+        let _ = std::fs::create_dir_all(dir.join(".contabo-ddns-write-test"));
         let blocked_write = LogConfig {
             level: "info".into(),
             dir: Some(dir.clone()),
-            file: "contabo-sync.log".into(),
+            file: "contabo-ddns.log".into(),
             rotate_size_mb: 1,
             rotate_keep: 2,
             to_stdout: false,
@@ -275,7 +275,7 @@ mod tests {
         let stdout = LogConfig {
             level: "info".into(),
             dir: None,
-            file: "contabo-sync.log".into(),
+            file: "contabo-ddns.log".into(),
             rotate_size_mb: 1,
             rotate_keep: 2,
             to_stdout: true,
@@ -319,12 +319,12 @@ mod tests {
     #[test]
     fn splits_log_file_name() {
         assert_eq!(
-            split_log_file("contabo-sync.log"),
-            ("contabo-sync".into(), "log".into())
+            split_log_file("contabo-ddns.log"),
+            ("contabo-ddns".into(), "log".into())
         );
         assert_eq!(
-            split_log_file("contabo-sync"),
-            ("contabo-sync".into(), "log".into())
+            split_log_file("contabo-ddns"),
+            ("contabo-ddns".into(), "log".into())
         );
         assert_eq!(split_log_file("a.b.log"), ("a.b".into(), "log".into()));
     }
