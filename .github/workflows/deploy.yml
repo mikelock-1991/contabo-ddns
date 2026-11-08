@@ -1,0 +1,409 @@
+name: Build and publish container
+
+on:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+# Git push and ruleset bypass use the pipeline GitHub App.
+# GITHUB_TOKEN is only for GHCR. Docker Hub uses DOCKERHUB_USERNAME and DOCKERHUB_TOKEN.
+# After the image smoke test, the app creates or updates GitHub Release v<version>.
+# dev keeps it a prerelease. main marks it as the latest release.
+# The notes are regenerated from commits since the previous tag on every publish.
+permissions: {}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha: ${{ steps.meta.outputs.sha }}
+      repo_lc: ${{ steps.meta.outputs.repo_lc }}
+      dependency_update: ${{ steps.change_source.outputs.dependency_update }}
+    permissions:
+      actions: write
+      packages: write
+    steps:
+      - name: Create pipeline app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.PIPELINE_APP_ID }}
+          private-key: ${{ secrets.PIPELINE_APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Detect automated dependency update
+        id: change_source
+        run: |
+          dependency_update=false
+          echo "Event: ${{ github.event_name }}"
+
+          for offset in $(seq 0 5); do
+            subject="$(git show -s --format=%s "HEAD~${offset}" 2>/dev/null)" || break
+            echo "Commit at HEAD~${offset}: ${subject:-[empty]}"
+
+            if [ "$subject" = 'chore: update dependencies (automated)' ]; then
+              dependency_update=true
+              break
+            fi
+            if [ "$subject" = 'chore: update dependencies (automated, major)' ]; then
+              break
+            fi
+            if [[ ! "$subject" =~ ^chore:\ bump\ patch\ version\ to\ .*\ \[skip\ ci\]$ ]]; then
+              break
+            fi
+          done
+
+          echo "dependency_update=${dependency_update}" >> "$GITHUB_OUTPUT"
+          echo "Automated dependency update (non-major)? ${dependency_update}"
+
+      - name: Install Rust
+        if: github.ref_name == 'dev'
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.99'
+
+      - name: Install cargo-edit
+        if: github.ref_name == 'dev'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+
+      - name: Bump patch version
+        if: github.ref_name == 'dev'
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+          BRANCH="${{ github.ref_name }}"
+          # Reset to the remote tip and re-bump so a concurrent push cannot publish a duplicate version.
+          for attempt in 1 2 3 4 5; do
+            git fetch origin "$BRANCH"
+            git reset --hard "origin/$BRANCH"
+            cargo set-version --bump patch
+            NEW_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+            git add Cargo.toml Cargo.lock
+            if git diff --staged --quiet; then
+              echo "No version change to commit."
+              exit 0
+            fi
+            git commit -m "chore: bump patch version to ${NEW_VERSION} [skip ci]"
+            if git push; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::Failed to push version bump after ${attempt} attempts"
+              exit 1
+            fi
+            echo "Push rejected (attempt ${attempt}); re-bumping from latest origin/${BRANCH}..."
+          done
+
+      - name: Read version
+        id: meta
+        run: |
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          REPO_LC=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          if [ "${{ github.ref_name }}" = "dev" ]; then
+            IMAGE_TAG=beta
+          else
+            IMAGE_TAG=latest
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "repo_lc=$REPO_LC" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          registry: docker.io
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          # Provenance attestations hide HEALTHCHECK from Podman.
+          provenance: false
+          sbom: false
+          tags: |
+            ghcr.io/${{ steps.meta.outputs.repo_lc }}:${{ steps.meta.outputs.image_tag }}
+            ghcr.io/${{ steps.meta.outputs.repo_lc }}:${{ steps.meta.outputs.version }}
+            docker.io/${{ vars.DOCKERHUB_USERNAME }}/contabo-ddns:${{ steps.meta.outputs.image_tag }}
+            docker.io/${{ vars.DOCKERHUB_USERNAME }}/contabo-ddns:${{ steps.meta.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  smoke:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+    permissions:
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image exits 2 without configuration
+        env:
+          VERSION: ${{ needs.build-and-push.outputs.version }}
+        run: |
+          repo_lc="$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${repo_lc}:${VERSION}"
+          docker pull "$image"
+          set +e
+          docker run --rm "$image"
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then
+            echo "::error::${image} exited ${code}; expected 2 for missing configuration"
+            exit 1
+          fi
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          registry: docker.io
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker Hub tag is pullable
+        env:
+          VERSION: ${{ needs.build-and-push.outputs.version }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+        run: docker pull "docker.io/${DOCKERHUB_USERNAME}/contabo-ddns:${VERSION}"
+
+      - name: Post-deploy webhook
+        env:
+          WEBHOOK_URL: ${{ vars.DEPLOY_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.DEPLOY_WEBHOOK_SECRET }}
+          VERSION: ${{ needs.build-and-push.outputs.version }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "::warning::DEPLOY_WEBHOOK_URL is not set; skipping webhook."
+            exit 0
+          fi
+          payload=$(jq -n \
+            --arg repo "${{ github.repository }}" \
+            --arg version "$VERSION" \
+            --arg sha "${{ github.sha }}" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg run_number "${{ github.run_number }}" \
+            --arg actor "${{ github.actor }}" \
+            '{repository:$repo,version:$version,sha:$sha,run:{id:$run_id,number:$run_number},actor:$actor,status:"success",event:"deploy",timestamp:(now|todate)}')
+          headers=(-H 'Content-Type: application/json')
+          if [ -n "$WEBHOOK_SECRET" ]; then
+            signature=$(printf '%s' "$payload" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | sed 's/^.* //')
+            headers+=(-H "X-Signature-256: sha256=$signature")
+          fi
+          curl -fsSL -X POST "${headers[@]}" -d "$payload" "$WEBHOOK_URL"
+
+  release:
+    needs: [build-and-push, smoke]
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+    steps:
+      - name: Create pipeline app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.PIPELINE_APP_ID }}
+          private-key: ${{ secrets.PIPELINE_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ needs.build-and-push.outputs.version }}
+          SHA: ${{ needs.build-and-push.outputs.sha }}
+          REPO_LC: ${{ needs.build-and-push.outputs.repo_lc }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          if [ "$REF_NAME" = "dev" ]; then
+            prerelease=true
+            make_latest=false
+            channel=beta
+            branch=dev
+          else
+            prerelease=false
+            make_latest=true
+            channel=latest
+            branch=main
+          fi
+
+          if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>/dev/null)"; then
+            release_id="$(jq -r '.id' <<<"$release_json")"
+            ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}")"
+            current="$(jq -r '.object.sha' <<<"$ref_json")"
+            if [ "$(jq -r '.object.type' <<<"$ref_json")" = "tag" ]; then
+              current="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${current}" --jq '.object.sha')"
+            fi
+            if [ "$current" != "$SHA" ]; then
+              gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}" \
+                -f sha="$SHA" -F force=true >/dev/null
+            fi
+          else
+            release_id=""
+          fi
+
+          generated="$(gh api --method POST "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="$tag" \
+            -f target_commitish="$SHA")"
+          generated_body="$(jq -r '.body // empty' <<<"$generated" | grep -v 'chore: bump patch version to ' || true)"
+
+          {
+            echo "Images for \`${VERSION}\` from \`${branch}\`."
+            echo
+            echo "| Registry | Channel | Version |"
+            echo "| --- | --- | --- |"
+            echo "| GHCR | \`ghcr.io/${REPO_LC}:${channel}\` | \`ghcr.io/${REPO_LC}:${VERSION}\` |"
+            echo "| Docker Hub | \`docker.io/${DOCKERHUB_USERNAME}/contabo-ddns:${channel}\` | \`docker.io/${DOCKERHUB_USERNAME}/contabo-ddns:${VERSION}\` |"
+            echo
+            printf '%s\n' "$generated_body"
+          } > release-notes.md
+
+          payload="$(jq -n \
+            --arg tag "$tag" \
+            --arg target "$SHA" \
+            --rawfile body release-notes.md \
+            --argjson prerelease "$prerelease" \
+            --arg make_latest "$make_latest" \
+            '{tag_name:$tag, target_commitish:$target, name:$tag, body:$body, draft:false, prerelease:$prerelease, make_latest:$make_latest}')"
+
+          if [ -n "$release_id" ]; then
+            echo "$payload" | gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" --input - >/dev/null
+            echo "Updated ${tag}."
+          else
+            echo "$payload" | gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" --input - >/dev/null
+            echo "Created ${tag}."
+          fi
+
+          url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${tag}"
+          echo "Release: ${url}"
+          {
+            echo "## ${tag}"
+            echo
+            echo "[${url}](${url})"
+            echo
+            cat release-notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  promote-dev-to-main:
+    needs: [build-and-push, smoke, release]
+    if: github.ref_name == 'dev' && needs.build-and-push.outputs.dependency_update == 'true'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Create pipeline app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.PIPELINE_APP_ID }}
+          private-key: ${{ secrets.PIPELINE_APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Push dev to main
+        env:
+          VERSION: ${{ needs.build-and-push.outputs.version }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+          git fetch origin main dev
+          AHEAD=$(git rev-list --count origin/main..origin/dev)
+          if [ "$AHEAD" -eq 0 ]; then
+            echo "dev is not ahead of main; skipping push."
+            exit 0
+          fi
+          git checkout -B main origin/main
+          if git merge --ff-only origin/dev; then
+            echo "Fast-forwarded main to dev."
+          else
+            git merge origin/dev -m "chore: promote dev to main after successful deploy (v${VERSION})"
+          fi
+          git push origin main
+
+  create-dev-to-main-pr:
+    needs: [build-and-push, smoke, release]
+    if: github.ref_name == 'dev' && needs.build-and-push.outputs.dependency_update != 'true'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Create pipeline app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.PIPELINE_APP_ID }}
+          private-key: ${{ secrets.PIPELINE_APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: dev
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Create or update dev to main pull request
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ needs.build-and-push.outputs.version }}
+        run: |
+          AHEAD=$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...dev" --jq '.ahead_by // 0')
+          if [ "$AHEAD" -eq 0 ]; then
+            echo "dev is not ahead of main; skipping PR."
+            exit 0
+          fi
+
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          body="Dev image was published and the container exited 2 with an empty environment.
+
+          **Version:** v${VERSION}
+          **Release:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/v${VERSION}
+          **Workflow run:** ${run_url}"
+
+          existing="$(gh pr list --base main --head dev --state open --json number --jq '.[0].number')"
+          if [ -n "$existing" ]; then
+            echo "Open PR already exists: #${existing}"
+            gh pr comment "$existing" --body "Updated after successful dev deploy (v${VERSION}). See ${run_url}"
+          else
+            gh pr create \
+              --base main \
+              --head dev \
+              --title "chore: promote dev to main (v${VERSION})" \
+              --body "$body" \
+              --assignee mikelock-1991
+          fi

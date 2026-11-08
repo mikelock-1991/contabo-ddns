@@ -1,0 +1,5 @@
+[alias]
+# cargo-llvm-cov compares file line coverage with `>`, so 100 never passes. 99.999 still fails any missed line in these files.
+coverage = "llvm-cov --summary-only --show-missing-lines --fail-under-lines 100 --fail-under-regions 100 --fail-under-functions 100 --fail-under-file-lines 99.999"
+check-fmt = "fmt --check"
+lint = "clippy --all-targets -- -D warnings"

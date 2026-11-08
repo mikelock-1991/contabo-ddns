@@ -1,0 +1,150 @@
+name: Automated Dependency Updates
+
+on:
+  schedule:
+    # Daily: compatible updates within the current major → push to dev
+    - cron: '0 5 * * *'
+      timezone: Europe/Amsterdam
+    # Monthly (1st at 06:00): major updates → PR
+    - cron: '0 6 1 * *'
+      timezone: Europe/Amsterdam
+  workflow_dispatch:
+    inputs:
+      update_type:
+        description: Update type (minor pushes to dev; major opens a PR)
+        required: true
+        default: minor
+        type: choice
+        options:
+          - minor
+          - major
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-updates
+  cancel-in-progress: false
+
+jobs:
+  update-deps:
+    name: Update Cargo dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create pipeline app token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.PIPELINE_APP_ID }}
+          private-key: ${{ secrets.PIPELINE_APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: dev
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.99'
+          components: clippy, rustfmt, llvm-tools-preview
+
+      - name: Install Cargo tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-edit,cargo-audit
+
+      - id: resolve-type
+        name: Resolve update type
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "update_type=${{ inputs.update_type }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 6 1 * *" ]; then
+            echo "update_type=major" >> "$GITHUB_OUTPUT"
+          else
+            echo "update_type=minor" >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: apply-updates
+        name: Check and apply dependency updates
+        env:
+          UPDATE_TYPE: ${{ steps.resolve-type.outputs.update_type }}
+        run: |
+          report_file="$RUNNER_TEMP/cargo-upgrade.md"
+          # Cargo.toml keeps exact "=" requirements. --pinned moves those to the new version.
+          if [ "$UPDATE_TYPE" = "major" ]; then
+            echo '## Major updates' > "$report_file"
+            cargo upgrade --dry-run --pinned --incompatible | tee -a "$report_file"
+            cargo upgrade --pinned --incompatible
+          else
+            echo '## Compatible updates' > "$report_file"
+            cargo upgrade --dry-run --pinned | tee -a "$report_file"
+            cargo upgrade --pinned
+          fi
+
+          if git diff --quiet --exit-code -- Cargo.toml Cargo.lock; then
+            echo "No dependency updates available."
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "has_major_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "status=success" >> "$GITHUB_OUTPUT"
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          if [ "$UPDATE_TYPE" = "major" ]; then
+            echo "has_major_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_major_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Audit when nothing was upgraded
+        if: steps.apply-updates.outputs.has_changes != 'true' && steps.apply-updates.outputs.status == 'success'
+        run: cargo audit
+
+      - name: Format, lint, and coverage
+        if: steps.apply-updates.outputs.has_changes == 'true'
+        run: |
+          cargo check-fmt
+          cargo lint
+          cargo coverage
+
+      - name: Push dependency updates to dev
+        if: steps.apply-updates.outputs.has_changes == 'true' && steps.apply-updates.outputs.has_major_changes != 'true'
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          if git diff --staged --quiet; then
+            echo "No dependency changes to commit."
+            exit 0
+          fi
+          git commit -m "chore: update dependencies (automated)"
+          git push origin HEAD:dev
+
+      - name: Create pull request for major dependency updates
+        if: steps.apply-updates.outputs.has_changes == 'true' && steps.apply-updates.outputs.has_major_changes == 'true'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          branch: chore/deps-major-update
+          add-paths: |
+            Cargo.toml
+            Cargo.lock
+          commit-message: |
+            chore: update dependencies (automated, major)
+          title: 'chore: update dependencies (major)'
+          body-path: ${{ runner.temp }}/cargo-upgrade.md
+          labels: dependencies, automated, major
+          delete-branch: true
+          base: dev
+          assignees: mikelock-1991
+          author: ${{ steps.app-token.outputs.app-slug }}[bot] <${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com>
+
+      - name: No changes summary
+        if: steps.apply-updates.outputs.has_changes != 'true'
+        run: echo "No dependency updates. cargo audit passed."
