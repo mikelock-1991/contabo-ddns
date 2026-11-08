@@ -75,46 +75,74 @@ jobs:
         with:
           tool: cargo-edit
 
-      - name: Bump patch version
+      - name: Prepare dev version
+        id: dev_version
         if: github.ref_name == 'dev'
         env:
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
         run: |
+          set -euo pipefail
           git config user.name "${APP_SLUG}[bot]"
           git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
           BRANCH="${{ github.ref_name }}"
-          # Reset to the remote tip and re-bump so a concurrent push cannot publish a duplicate version.
+          cargo_version() {
+            sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1
+          }
+          # Cargo.toml keeps the next stable version. Each dev publish gets {version}-beta.N.
           for attempt in 1 2 3 4 5; do
-            git fetch origin "$BRANCH"
+            git fetch origin "$BRANCH" --tags
             git reset --hard "origin/$BRANCH"
-            cargo set-version --bump patch
-            NEW_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-            git add Cargo.toml Cargo.lock
-            if git diff --staged --quiet; then
-              echo "No version change to commit."
-              exit 0
+            base="$(cargo_version)"
+            base="${base%%-*}"
+            if git ls-remote --exit-code --tags origin "refs/tags/v${base}" >/dev/null; then
+              IFS=. read -r major minor patch <<<"$base"
+              next="${major}.${minor}.$((patch + 1))"
+              cargo set-version "$next"
+              git add Cargo.toml Cargo.lock
+              if ! git diff --staged --quiet; then
+                git commit -m "chore: bump patch version to ${next} [skip ci]"
+                if ! git push; then
+                  if [ "$attempt" -eq 5 ]; then
+                    echo "::error::Failed to push version bump after ${attempt} attempts"
+                    exit 1
+                  fi
+                  echo "Push rejected (attempt ${attempt}); retrying from latest origin/${BRANCH}..."
+                  continue
+                fi
+              fi
+              base="$next"
             fi
-            git commit -m "chore: bump patch version to ${NEW_VERSION} [skip ci]"
-            if git push; then
-              exit 0
+            head_sha="$(git rev-parse HEAD)"
+            reuse="$(git ls-remote --tags origin "refs/tags/v${base}-beta.*" | awk -v sha="$head_sha" '$1 == sha { sub("refs/tags/v", "", $2); print $2; exit }')"
+            if [ -n "$reuse" ]; then
+              version="$reuse"
+            else
+              n=1
+              while git ls-remote --exit-code --tags origin "refs/tags/v${base}-beta.${n}" >/dev/null; do
+                n=$((n + 1))
+                if [ "$n" -gt 1000 ]; then
+                  echo "::error::Too many beta tags for ${base}"
+                  exit 1
+                fi
+              done
+              version="${base}-beta.${n}"
             fi
-            if [ "$attempt" -eq 5 ]; then
-              echo "::error::Failed to push version bump after ${attempt} attempts"
-              exit 1
-            fi
-            echo "Push rejected (attempt ${attempt}); re-bumping from latest origin/${BRANCH}..."
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
+            echo "Dev version ${version}"
+            exit 0
           done
 
       - name: Read version
         id: meta
         run: |
-          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-          REPO_LC=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
           if [ "${{ github.ref_name }}" = "dev" ]; then
+            VERSION="${{ steps.dev_version.outputs.version }}"
             IMAGE_TAG=beta
           else
+            VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
             IMAGE_TAG=latest
           fi
+          REPO_LC=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "repo_lc=$REPO_LC" >> "$GITHUB_OUTPUT"
@@ -260,17 +288,9 @@ jobs:
             branch=main
           fi
 
+          # An existing tag stays where it was created. Rulesets reject moving it onto a later merge commit.
           if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>/dev/null)"; then
             release_id="$(jq -r '.id' <<<"$release_json")"
-            ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}")"
-            current="$(jq -r '.object.sha' <<<"$ref_json")"
-            if [ "$(jq -r '.object.type' <<<"$ref_json")" = "tag" ]; then
-              current="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${current}" --jq '.object.sha')"
-            fi
-            if [ "$current" != "$SHA" ]; then
-              gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}" \
-                -f sha="$SHA" -F force=true >/dev/null
-            fi
           else
             release_id=""
           fi
@@ -291,18 +311,23 @@ jobs:
             printf '%s\n' "$generated_body"
           } > release-notes.md
 
-          payload="$(jq -n \
-            --arg tag "$tag" \
-            --arg target "$SHA" \
-            --rawfile body release-notes.md \
-            --argjson prerelease "$prerelease" \
-            --arg make_latest "$make_latest" \
-            '{tag_name:$tag, target_commitish:$target, name:$tag, body:$body, draft:false, prerelease:$prerelease, make_latest:$make_latest}')"
-
           if [ -n "$release_id" ]; then
+            payload="$(jq -n \
+              --arg tag "$tag" \
+              --rawfile body release-notes.md \
+              --argjson prerelease "$prerelease" \
+              --arg make_latest "$make_latest" \
+              '{tag_name:$tag, name:$tag, body:$body, draft:false, prerelease:$prerelease, make_latest:$make_latest}')"
             echo "$payload" | gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" --input - >/dev/null
             echo "Updated ${tag}."
           else
+            payload="$(jq -n \
+              --arg tag "$tag" \
+              --arg target "$SHA" \
+              --rawfile body release-notes.md \
+              --argjson prerelease "$prerelease" \
+              --arg make_latest "$make_latest" \
+              '{tag_name:$tag, target_commitish:$target, name:$tag, body:$body, draft:false, prerelease:$prerelease, make_latest:$make_latest}')"
             echo "$payload" | gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" --input - >/dev/null
             echo "Created ${tag}."
           fi
