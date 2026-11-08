@@ -1,0 +1,22 @@
+services:
+  contabo-ddns:
+    init: true
+    build: .
+    image: contabo-ddns
+    env_file:
+      - .env
+    environment:
+      LOG_DIR: /var/log/contabo-ddns
+    volumes:
+      - contabo-ddns-logs:/var/log/contabo-ddns
+    restart: unless-stopped
+    # Longer than one 30s HTTP timeout, so a stop during a request still exits cleanly.
+    stop_grace_period: 45s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  contabo-ddns-logs:
