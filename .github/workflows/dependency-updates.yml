@@ -84,7 +84,7 @@ jobs:
             cargo upgrade --pinned
           fi
 
-          # Pin the builder to the newest stable Rust and the digest of its -alpine image.
+          # Pin the builder to the newest stable Rust and the digest of its bookworm image.
           rust_version="$(curl -fsSL "https://static.rust-lang.org/dist/channel-rust-stable.toml" | awk '
             $0 == "[pkg.rust]" { in_rust = 1; next }
             in_rust && /^version = / { gsub(/"/, "", $3); print $3; exit }
@@ -98,13 +98,13 @@ jobs:
           rust_digest="$(curl -fsSL -D - -o /dev/null \
             -H "Authorization: Bearer ${token}" \
             -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
-            "https://registry-1.docker.io/v2/library/rust/manifests/${rust_version}-alpine" \
+            "https://registry-1.docker.io/v2/library/rust/manifests/${rust_version}-bookworm" \
             | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:" { print $2; exit }')"
           if ! [[ "$rust_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "::error::Unexpected Rust image digest: ${rust_digest:-empty}"
             exit 1
           fi
-          rust_pinned="${rust_version}-alpine@${rust_digest}"
+          rust_pinned="${rust_version}-bookworm@${rust_digest}"
           rust_current="$(sed -n 's/^FROM rust:\([^ ]*\).*/\1/p' Dockerfile | head -1)"
           rust_changed=false
           if [ "$rust_current" = "$rust_pinned" ]; then
@@ -129,31 +129,25 @@ jobs:
             rust_changed=true
           done
 
-          # Pin the runtime image to the newest Alpine x.y.z and the digest of that tag.
-          # The tag name keeps the Dockerfile readable. The digest keeps the build reproducible.
-          alpine_version="$(curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml" | awk '/^  version: / { print $2; exit }')"
-          if ! [[ "$alpine_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Unexpected Alpine version: ${alpine_version:-empty}"
-            exit 1
-          fi
-          token="$(curl -fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/alpine:pull" | jq -r '.token')"
-          alpine_digest="$(curl -fsSL -D - -o /dev/null \
+          # Pin the runtime image to the current distroless nonroot digest. The tag stays nonroot (uid 65532).
+          token="$(curl -fsSL "https://gcr.io/v2/token?service=gcr.io&scope=repository:distroless/static-debian13:pull" | jq -r '.token')"
+          runtime_digest="$(curl -fsSL -D - -o /dev/null \
             -H "Authorization: Bearer ${token}" \
             -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
-            "https://registry-1.docker.io/v2/library/alpine/manifests/${alpine_version}" \
+            "https://gcr.io/v2/distroless/static-debian13/manifests/nonroot" \
             | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:" { print $2; exit }')"
-          if ! [[ "$alpine_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::Unexpected Alpine digest: ${alpine_digest:-empty}"
+          if ! [[ "$runtime_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Unexpected distroless digest: ${runtime_digest:-empty}"
             exit 1
           fi
-          current="$(sed -n 's/^FROM alpine://p' Dockerfile | head -1)"
-          pinned="${alpine_version}@${alpine_digest}"
-          if [ "$current" = "$pinned" ]; then
-            echo "Alpine runtime already pinned to ${pinned}."
+          runtime_pinned="gcr.io/distroless/static-debian13:nonroot@${runtime_digest}"
+          runtime_current="$(sed -n 's/^FROM //p' Dockerfile | grep '^gcr.io/distroless/static-debian13:nonroot@' | head -1)"
+          if [ "$runtime_current" = "$runtime_pinned" ]; then
+            echo "Distroless runtime already pinned to ${runtime_pinned}."
           else
-            echo "Alpine runtime ${current:-unpinned} -> ${pinned}"
-            printf '\n## Alpine runtime\n\n- `%s` -> `%s`\n' "${current:-unpinned}" "$pinned" >> "$report_file"
-            sed -i "s|^FROM alpine:.*|FROM alpine:${pinned}|" Dockerfile
+            echo "Distroless runtime ${runtime_current:-unpinned} -> ${runtime_pinned}"
+            printf '\n## Runtime image\n\n- `%s` -> `%s`\n' "${runtime_current:-unpinned}" "$runtime_pinned" >> "$report_file"
+            sed -i "s|^FROM gcr.io/distroless/static-debian13:nonroot.*|FROM ${runtime_pinned}|" Dockerfile
           fi
 
           echo "rust_version=${rust_version}" >> "$GITHUB_OUTPUT"
