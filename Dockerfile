@@ -6,11 +6,16 @@ FROM dhi.io/rust:1.99.1-debian13-dev@sha256:caad43bd38067fba8be69a1540c3350d1ff3
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl xz-utils \
     && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL "https://static.rust-lang.org/dist/rust-std-${RUST_VERSION}-x86_64-unknown-linux-musl.tar.xz" -o /tmp/rust-std.tar.xz \
+    && rust_version="$(rustc --version | awk '{print $2}')" \
+    && case "$rust_version" in \
+         [0-9]*.[0-9]*.[0-9]*) ;; \
+         *) echo "unexpected rustc version: ${rust_version:-empty}"; exit 1 ;; \
+       esac \
+    && curl -fsSL "https://static.rust-lang.org/dist/rust-std-${rust_version}-x86_64-unknown-linux-musl.tar.xz" -o /tmp/rust-std.tar.xz \
     && tar -xJf /tmp/rust-std.tar.xz -C /tmp \
-    && "/tmp/rust-std-${RUST_VERSION}-x86_64-unknown-linux-musl/install.sh" --prefix=/usr/local --disable-ldconfig \
+    && "/tmp/rust-std-${rust_version}-x86_64-unknown-linux-musl/install.sh" --prefix=/usr/local --disable-ldconfig \
     && test -d "$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-musl/lib" \
-    && rm -rf /tmp/rust-std.tar.xz "/tmp/rust-std-${RUST_VERSION}-x86_64-unknown-linux-musl"
+    && rm -rf /tmp/rust-std.tar.xz "/tmp/rust-std-${rust_version}-x86_64-unknown-linux-musl"
 # Static musl for the program only. Proc macros stay on the glibc host.
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-feature=+crt-static"
 WORKDIR /src
