@@ -136,16 +136,30 @@ fn assemble(
 
 fn build_client(roots: crate::config::TlsRoots, local: Option<IpAddr>) -> Result<Client, Error> {
     use crate::config::TlsRoots;
+    // reqwest 0.13 with rustls-no-provider panics unless a process-wide provider
+    // is installed. ring keeps the static musl image off aws-lc.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut builder = Client::builder()
         .user_agent("contabo-ddns")
         .timeout(HTTP_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
-        .tls_built_in_webpki_certs(matches!(roots, TlsRoots::Both | TlsRoots::Webpki))
-        .tls_built_in_native_certs(matches!(roots, TlsRoots::Both | TlsRoots::Native));
+        .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS));
+    builder = match roots {
+        TlsRoots::Native => builder,
+        TlsRoots::Webpki => builder.tls_certs_only(mozilla_roots()),
+        TlsRoots::Both => builder.tls_certs_merge(mozilla_roots()),
+    };
     if let Some(addr) = local {
         builder = builder.local_address(addr);
     }
     finish_build(builder.build())
+}
+
+/// Embedded Mozilla roots. `from_der` only stores the bytes when rustls is the TLS backend.
+fn mozilla_roots() -> Vec<reqwest::Certificate> {
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .filter_map(|der| reqwest::Certificate::from_der(der).ok())
+        .collect()
 }
 
 fn finish_build(result: Result<Client, reqwest::Error>) -> Result<Client, Error> {
