@@ -13,19 +13,17 @@ on:
 permissions: {}
 
 jobs:
-  build-and-push:
+  prepare:
     runs-on: ubuntu-latest
     environment: ${{ github.ref_name }}
     outputs:
       version: ${{ steps.meta.outputs.version }}
       sha: ${{ steps.meta.outputs.sha }}
       repo_lc: ${{ steps.meta.outputs.repo_lc }}
-      digest: ${{ steps.build.outputs.digest }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
       dependency_update: ${{ steps.change_source.outputs.dependency_update }}
     permissions:
-      actions: write
-      id-token: write
-      packages: write
+      contents: read
     steps:
       - name: Create pipeline app token
         id: app-token
@@ -150,10 +148,29 @@ jobs:
           echo "repo_lc=$REPO_LC" >> "$GITHUB_OUTPUT"
           echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+  image:
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    environment: ${{ github.ref_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+            scope: amd64
+          - runner: ubuntu-26.04-arm
+            platform: linux/arm64
+            scope: arm64
+    permissions:
+      actions: write
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
         with:
-          platforms: arm64
+          ref: ${{ needs.prepare.outputs.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -179,36 +196,156 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
+          platforms: ${{ matrix.platform }}
           # Provenance attestations hide HEALTHCHECK from Podman.
           provenance: false
           sbom: false
-          tags: |
-            ghcr.io/${{ steps.meta.outputs.repo_lc }}:${{ steps.meta.outputs.image_tag }}
-            ghcr.io/${{ steps.meta.outputs.repo_lc }}:${{ steps.meta.outputs.version }}
-            docker.io/${{ vars.DOCKERHUB_USERNAME }}/contabo-ddns:${{ steps.meta.outputs.image_tag }}
-            docker.io/${{ vars.DOCKERHUB_USERNAME }}/contabo-ddns:${{ steps.meta.outputs.version }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+          cache-from: type=gha,scope=${{ matrix.scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.scope }}
+          outputs: |
+            type=image,name=ghcr.io/${{ needs.prepare.outputs.repo_lc }},push-by-digest=true,name-canonical=true,push=true
+            type=image,name=docker.io/${{ vars.DOCKERHUB_USERNAME }}/contabo-ddns,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          if ! [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Unexpected image digest: ${DIGEST:-empty}"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-digest-${{ matrix.scope }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  build-and-push:
+    needs: [prepare, image]
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+    outputs:
+      version: ${{ needs.prepare.outputs.version }}
+      sha: ${{ needs.prepare.outputs.sha }}
+      repo_lc: ${{ needs.prepare.outputs.repo_lc }}
+      digest: ${{ steps.publish.outputs.digest }}
+      dependency_update: ${{ needs.prepare.outputs.dependency_update }}
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          registry: docker.io
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: image-digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Publish multi-arch manifests
+        id: publish
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+          REPO_LC: ${{ needs.prepare.outputs.repo_lc }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+          mapfile -t digests < <(find "$RUNNER_TEMP/digests" -type f -printf '%f\n' | sort)
+          if [ "${#digests[@]}" -ne 2 ]; then
+            echo "::error::Expected 2 image digests, found ${#digests[@]}"
+            find "$RUNNER_TEMP/digests" -type f -print
+            exit 1
+          fi
+          ghcr_sources=()
+          hub_sources=()
+          for hex in "${digests[@]}"; do
+            if ! [[ "$hex" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::Unexpected digest file: ${hex}"
+              exit 1
+            fi
+            ghcr_sources+=("ghcr.io/${REPO_LC}@sha256:${hex}")
+            hub_sources+=("docker.io/${DOCKERHUB_USERNAME}/contabo-ddns@sha256:${hex}")
+          done
+          annotations=(
+            --annotation "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+            --annotation "index:org.opencontainers.image.version=${VERSION}"
+          )
+          docker buildx imagetools create "${annotations[@]}" \
+            -t "ghcr.io/${REPO_LC}:${IMAGE_TAG}" \
+            -t "ghcr.io/${REPO_LC}:${VERSION}" \
+            "${ghcr_sources[@]}"
+          docker buildx imagetools create "${annotations[@]}" \
+            -t "docker.io/${DOCKERHUB_USERNAME}/contabo-ddns:${IMAGE_TAG}" \
+            -t "docker.io/${DOCKERHUB_USERNAME}/contabo-ddns:${VERSION}" \
+            "${hub_sources[@]}"
+          index_digest() {
+            docker buildx imagetools inspect "$1" | awk '/^Digest:/ { print $2; exit }'
+          }
+          ghcr_ref="ghcr.io/${REPO_LC}:${VERSION}"
+          hub_ref="docker.io/${DOCKERHUB_USERNAME}/contabo-ddns:${VERSION}"
+          ghcr_digest="$(index_digest "$ghcr_ref")"
+          hub_digest="$(index_digest "$hub_ref")"
+          for digest in "$ghcr_digest" "$hub_digest"; do
+            if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Unexpected manifest digest: ${digest:-empty}"
+              exit 1
+            fi
+          done
+          for ref in "$ghcr_ref" "$hub_ref"; do
+            platforms="$(docker buildx imagetools inspect "$ref")"
+            printf '%s\n' "$platforms"
+            if ! printf '%s\n' "$platforms" | grep -q 'linux/amd64' || ! printf '%s\n' "$platforms" | grep -q 'linux/arm64'; then
+              echo "::error::${ref} is missing linux/amd64 or linux/arm64"
+              exit 1
+            fi
+          done
+          if [ "$ghcr_digest" != "$hub_digest" ]; then
+            echo "::error::GHCR digest ${ghcr_digest} does not match Docker Hub digest ${hub_digest}"
+            exit 1
+          fi
+          echo "digest=${ghcr_digest}" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
       - name: Sign images
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
           DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          REPO_LC: ${{ needs.prepare.outputs.repo_lc }}
         run: |
-          cosign sign --yes "ghcr.io/${{ steps.meta.outputs.repo_lc }}@${DIGEST}"
+          cosign sign --yes "ghcr.io/${REPO_LC}@${DIGEST}"
           cosign sign --yes "docker.io/${DOCKERHUB_USERNAME}/contabo-ddns@${DIGEST}"
 
   smoke:
