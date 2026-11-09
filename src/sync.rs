@@ -6,13 +6,15 @@ use crate::config::Config;
 use crate::contabo::ContaboClient;
 use crate::error::Error;
 use crate::firewall::FirewallState;
-use crate::ip::{Resolver, fetch_public_ip};
+use crate::ip::{PublicIps, Resolver, fetch_public_ip, fetch_public_ipv6};
 
-/// Fetches the public IP when needed, then runs DNS and firewall sync on threads.
+/// Fetches the public addresses when needed, then runs DNS and firewall sync on threads.
 ///
-/// DNS and firewall share one token-caching `ContaboClient`. A failed IP lookup
-/// skips DNS and any firewall that uses `current`, but a firewall with only literal
-/// or hostname sources still syncs. Errors from every step are joined with `"; "`.
+/// DNS and firewall share one token-caching `ContaboClient`. A failed IPv4 lookup
+/// still updates AAAA records when the IPv6 lookup succeeded. A firewall that uses
+/// `current` is skipped when the IPv4 address is unknown, and one that uses
+/// `current6` is skipped when the IPv6 address is unknown. A firewall with only
+/// literal or hostname sources still syncs. Errors from every step are joined with `"; "`.
 pub fn run_cycle(
     cfg: &Config,
     client: &ContaboClient<'_>,
@@ -23,14 +25,10 @@ pub fn run_cycle(
     if cfg.dry_run {
         log::info!("dry-run: PATCH and PUT are disabled");
     }
-    let firewall_needs_ip = cfg.firewall.as_ref().is_some_and(|firewall| {
-        firewall
-            .rules
-            .iter()
-            .any(|rule| rule.sources.iter().any(|source| source.trim() == "current"))
-    });
+    let firewall_needs_v4 = uses_source(cfg, "current");
+    let firewall_needs_v6 = uses_source(cfg, "current6");
     let mut errors = Vec::new();
-    let ip = if cfg.dns.is_some() || firewall_needs_ip {
+    let v4 = if cfg.dns.is_some() || firewall_needs_v4 {
         match fetch_public_ip(
             client.http(),
             &cfg.ip_echo_urls,
@@ -50,22 +48,47 @@ pub fn run_cycle(
     } else {
         None
     };
+    let v6 = if cfg.ipv6 && (cfg.dns.is_some() || firewall_needs_v6) {
+        match fetch_public_ipv6(
+            client.http(),
+            &cfg.ip_echo_urls,
+            cfg.ip_echo_timeout,
+            client.shutdown(),
+            client.retry_delay(),
+        ) {
+            Ok(ip) => {
+                log::info!("public ipv6 {ip}");
+                Some(ip)
+            }
+            Err(err) => {
+                errors.push(err.to_string());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let ips = PublicIps { v4, v6 };
     let firewall = cfg.firewall.as_ref();
-    let firewall = if firewall_needs_ip && ip.is_none() {
+    let firewall = if firewall_needs_v4 && v4.is_none() {
         log::warn!("firewall skipped: a rule uses current and the public ip is unknown");
+        None
+    } else if firewall_needs_v6 && v6.is_none() {
+        log::warn!("firewall skipped: a rule uses current6 and the public ipv6 is unknown");
         None
     } else {
         firewall
     };
 
     thread::scope(|scope| {
-        let dns_job =
-            cfg.dns.as_ref().zip(ip).map(|(dns, ip)| {
-                scope.spawn(move || crate::dns::sync(client, dns, ip, cfg.dry_run))
-            });
+        let dns_job = cfg
+            .dns
+            .as_ref()
+            .filter(|_| v4.is_some() || v6.is_some())
+            .map(|dns| scope.spawn(move || crate::dns::sync(client, dns, ips, cfg.dry_run)));
         let firewall_job = firewall.map(|firewall| {
             scope.spawn(|| {
-                crate::firewall::sync(client, firewall, ip, resolver, cfg.dry_run, firewall_state)
+                crate::firewall::sync(client, firewall, ips, resolver, cfg.dry_run, firewall_state)
             })
         });
         if let Some(job) = dns_job
@@ -87,6 +110,16 @@ pub fn run_cycle(
     }
 }
 
+fn uses_source(cfg: &Config, source: &str) -> bool {
+    cfg.firewall.as_ref().is_some_and(|firewall| {
+        firewall.rules.iter().any(|rule| {
+            rule.sources
+                .iter()
+                .any(|configured| configured.trim() == source)
+        })
+    })
+}
+
 /// Unwraps a scoped-thread join: inner `Err` stays, a panic becomes `{label} thread panicked`.
 fn join_job<T>(result: thread::Result<Result<T, Error>>, label: &str) -> Result<T, Error> {
     match result {
@@ -98,7 +131,7 @@ fn join_job<T>(result: thread::Result<Result<T, Error>>, label: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contabo::{Http, HttpRequest, HttpResponse};
+    use crate::contabo::{Http, HttpRequest, HttpResponse, IpFamily};
     use crate::ip::MapResolver;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -138,9 +171,7 @@ mod tests {
         let http = Scripted {
             calls: Mutex::new(Vec::new()),
         };
-        let resolver = MapResolver {
-            values: std::collections::HashMap::new(),
-        };
+        let resolver = MapResolver::default();
         let err = run_cycle(&cfg, &api(&cfg, &http), &resolver, &FirewallState::new()).unwrap_err();
         assert!(err.to_string().contains("public ip lookup failed"));
         let calls = http.calls.lock().unwrap();
@@ -154,9 +185,7 @@ mod tests {
         let http = Scripted {
             calls: Mutex::new(Vec::new()),
         };
-        let resolver = MapResolver {
-            values: std::collections::HashMap::new(),
-        };
+        let resolver = MapResolver::default();
         let err = run_cycle(&cfg, &api(&cfg, &http), &resolver, &FirewallState::new()).unwrap_err();
         assert!(err.to_string().contains("public ip lookup failed"));
         let calls = http.calls.lock().unwrap();
@@ -252,9 +281,7 @@ mod tests {
         let http = Chain {
             step: Mutex::new(0),
         };
-        let resolver = MapResolver {
-            values: std::collections::HashMap::new(),
-        };
+        let resolver = MapResolver::default();
         let err = run_cycle(&cfg, &api(&cfg, &http), &resolver, &FirewallState::new()).unwrap_err();
         assert!(err.to_string().contains("dns list down"));
         assert!(err.to_string().contains("firewall read down"));
@@ -312,9 +339,7 @@ mod tests {
         let http = Scripted {
             calls: Mutex::new(Vec::new()),
         };
-        let resolver = MapResolver {
-            values: std::collections::HashMap::new(),
-        };
+        let resolver = MapResolver::default();
         run_cycle(&cfg, &api(&cfg, &http), &resolver, &FirewallState::new()).unwrap();
         {
             let calls = http.calls.lock().unwrap();
@@ -365,9 +390,7 @@ mod tests {
         let http = crate::test_http::DnsCycleOk {
             calls: Mutex::new(Vec::new()),
         };
-        let resolver = MapResolver {
-            values: std::collections::HashMap::new(),
-        };
+        let resolver = MapResolver::default();
         run_cycle(&cfg, &api(&cfg, &http), &resolver, &FirewallState::new()).unwrap();
     }
 
@@ -387,9 +410,7 @@ mod tests {
         let http = crate::test_http::Unscripted {
             calls: Mutex::new(Vec::new()),
         };
-        let resolver = MapResolver {
-            values: std::collections::HashMap::new(),
-        };
+        let resolver = MapResolver::default();
         assert!(run_cycle(&cfg, &api(&cfg, &http), &resolver, &FirewallState::new()).is_err());
     }
 
@@ -454,9 +475,7 @@ mod tests {
         let http = Both {
             calls: Mutex::new(Vec::new()),
         };
-        let resolver = MapResolver {
-            values: std::collections::HashMap::new(),
-        };
+        let resolver = MapResolver::default();
         run_cycle(&cfg, &api(&cfg, &http), &resolver, &FirewallState::new()).unwrap();
         {
             let calls = http.calls.lock().unwrap();
@@ -476,5 +495,148 @@ mod tests {
             .to_string()
             .contains("unexpected")
         );
+    }
+
+    #[test]
+    fn ipv6_updates_aaaa_and_current6_while_v4_failure_stays_an_error() {
+        let cfg = Config::from_pairs([
+            ("CONTABO_CLIENT_ID", "id"),
+            ("CONTABO_CLIENT_SECRET", "secret"),
+            ("CONTABO_API_USER", "user@example.com"),
+            ("CONTABO_API_PASSWORD", "pw"),
+            ("DNS_RECORDS", "home.example.com"),
+            ("FIREWALL_ID", "fw-1"),
+            (
+                "FIREWALL_RULES",
+                r#"[{"displayName":"SSH","sources":["current6"]}]"#,
+            ),
+            ("INTERVAL_SECONDS", "0"),
+            ("LOG_DIR", ""),
+            ("IP_ECHO_URL", "https://ipecho.test/plain"),
+            ("IPV6", "true"),
+        ])
+        .unwrap();
+        struct Dual {
+            calls: Mutex<Vec<String>>,
+        }
+        impl Http for Dual {
+            fn send_family(
+                &self,
+                request: &HttpRequest,
+                family: IpFamily,
+            ) -> Result<HttpResponse, Error> {
+                self.calls.lock().unwrap().push(request.url.clone());
+                match family {
+                    IpFamily::V4 => Err(Error::new("v4 down")),
+                    IpFamily::V6 => Ok(HttpResponse {
+                        status: 200,
+                        body: b"2606:4700:4700::1111\n".to_vec(),
+                    }),
+                }
+            }
+
+            fn send(&self, request: &HttpRequest) -> Result<HttpResponse, Error> {
+                self.calls.lock().unwrap().push(request.url.clone());
+                if request.url.contains("/token") {
+                    return Ok(HttpResponse {
+                        status: 200,
+                        body: br#"{"access_token":"tok","expires_in":3600}"#.to_vec(),
+                    });
+                }
+                if request.method == "GET" && request.url.contains("/v1/dns/zones?") {
+                    return Ok(HttpResponse {
+                        status: 200,
+                        body: br#"{"data":[{"zoneName":"example.com"}]}"#.to_vec(),
+                    });
+                }
+                if request.method == "GET" && request.url.contains("/records") {
+                    return Ok(HttpResponse {
+                        status: 200,
+                        body: br#"{"data":[{"recordId":2,"name":"home","type":"AAAA","ttl":60,"prio":0,"data":"2606:4700:4700::1"}]}"#.to_vec(),
+                    });
+                }
+                if request.method == "PATCH" {
+                    return Ok(HttpResponse {
+                        status: 200,
+                        body: br#"{"data":[]}"#.to_vec(),
+                    });
+                }
+                if request.method == "GET" && request.url.contains("/v1/firewalls/") {
+                    return Ok(HttpResponse {
+                        status: 200,
+                        body: br#"{"data":[{"firewallId":"fw-1","rules":{"inbound":[{"displayName":"SSH","srcCidr":{"ipv4":["203.0.113.5/32"],"ipv6":["2001:db8::/64"]}}]}}]}"#.to_vec(),
+                    });
+                }
+                if request.method == "PUT" {
+                    return Ok(HttpResponse {
+                        status: 200,
+                        body: br#"{"data":[]}"#.to_vec(),
+                    });
+                }
+                crate::test_http::reject(request)
+            }
+        }
+        let http = Dual {
+            calls: Mutex::new(Vec::new()),
+        };
+        let err = run_cycle(
+            &cfg,
+            &api(&cfg, &http),
+            &MapResolver::default(),
+            &FirewallState::new(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("public ip lookup failed"));
+        {
+            let calls = http.calls.lock().unwrap();
+            assert!(calls.iter().any(|url| url.contains("/records/2")));
+            assert!(calls.iter().any(|url| url.contains("/v1/firewalls/fw-1")));
+        }
+        assert!(
+            http.send(&HttpRequest {
+                method: "POST".into(),
+                url: "https://api.example.test/unexpected".into(),
+                headers: vec![],
+                body: None,
+                timeout: None,
+                max_body: None,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected")
+        );
+    }
+
+    #[test]
+    fn current6_without_ipv6_skips_the_firewall() {
+        let cfg = Config::from_pairs([
+            ("CONTABO_CLIENT_ID", "id"),
+            ("CONTABO_CLIENT_SECRET", "secret"),
+            ("CONTABO_API_USER", "user@example.com"),
+            ("CONTABO_API_PASSWORD", "pw"),
+            ("DNS_ENABLED", "false"),
+            ("FIREWALL_ID", "fw-1"),
+            (
+                "FIREWALL_RULES",
+                r#"[{"displayName":"SSH","sources":["current6"]}]"#,
+            ),
+            ("INTERVAL_SECONDS", "0"),
+            ("LOG_DIR", ""),
+            ("IPV6", "true"),
+        ])
+        .unwrap();
+        let http = Scripted {
+            calls: Mutex::new(Vec::new()),
+        };
+        let err = run_cycle(
+            &cfg,
+            &api(&cfg, &http),
+            &MapResolver::default(),
+            &FirewallState::new(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("public ipv6 lookup failed"));
+        let calls = http.calls.lock().unwrap();
+        assert!(calls.iter().all(|url| !url.contains("/v1/firewalls/")));
     }
 }
