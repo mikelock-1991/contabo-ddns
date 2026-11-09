@@ -47,14 +47,14 @@ pub struct DnsConfig {
     pub create_missing: bool,
 }
 
-/// One named inbound rule and the IPv4 sources that should replace its list.
+/// One named inbound rule and the sources that should replace its address lists.
 #[derive(Debug)]
 pub struct FirewallRuleConfig {
     pub display_name: String,
     pub sources: Vec<String>,
 }
 
-/// Firewall lookup (id or name) plus the rules whose IPv4 sources are rewritten.
+/// Firewall lookup (id or name) plus the rules whose sources are rewritten.
 #[derive(Debug)]
 pub struct FirewallConfig {
     pub id: Option<String>,
@@ -82,6 +82,7 @@ pub struct Config {
     pub api_base: String,
     pub auth_url: String,
     pub ip_echo_urls: Vec<String>,
+    pub ipv6: bool,
     pub ip_echo_timeout: Duration,
     pub dns: Option<DnsConfig>,
     pub firewall: Option<FirewallConfig>,
@@ -103,6 +104,7 @@ impl fmt::Debug for Config {
             .field("api_base", &self.api_base)
             .field("auth_url", &self.auth_url)
             .field("ip_echo_urls", &self.ip_echo_urls)
+            .field("ipv6", &self.ipv6)
             .field("dns", &self.dns)
             .field("firewall", &self.firewall)
             .field("run_on_start", &self.run_on_start)
@@ -158,6 +160,10 @@ impl Config {
             .to_string();
         let ip_echo_urls =
             parse_ip_echo_urls(optional(map, "IP_ECHO_URL").unwrap_or(DEFAULT_IP_ECHO_URL))?;
+        let ipv6 = match optional(map, "IPV6") {
+            Some(value) => parse_bool("IPV6", value)?,
+            None => false,
+        };
         require_https("CONTABO_API_BASE", &api_base)?;
         require_https("CONTABO_AUTH_URL", &auth_url)?;
 
@@ -175,6 +181,17 @@ impl Config {
             return Err(Error::new(
                 "set DNS_RECORDS or FIREWALL_RULES, or enable one of them explicitly",
             ));
+        }
+        if !ipv6
+            && firewall.as_ref().is_some_and(|firewall| {
+                firewall.rules.iter().any(|rule| {
+                    rule.sources
+                        .iter()
+                        .any(|source| source.trim() == "current6")
+                })
+            })
+        {
+            return Err(Error::new("current6 requires IPV6=true"));
         }
 
         let run_on_start = match optional(map, "RUN_ON_START") {
@@ -210,6 +227,7 @@ impl Config {
             api_base,
             auth_url,
             ip_echo_urls,
+            ipv6,
             ip_echo_timeout: Duration::from_secs(timeout_secs),
             dns,
             firewall,
@@ -413,7 +431,7 @@ fn parse_firewall(map: &HashMap<String, String>) -> Result<Option<FirewallConfig
             }
             if !valid_firewall_source(&source) {
                 return Err(Error::new(format!(
-                    "firewall source {source} is not an IPv4 address, CIDR, hostname, or current"
+                    "firewall source {source} is not an IP address, CIDR, hostname, current, or current6"
                 )));
             }
             if slot.1.insert(source.clone()) {
@@ -451,10 +469,12 @@ fn parse_firewall(map: &HashMap<String, String>) -> Result<Option<FirewallConfig
     Ok(Some(FirewallConfig { id, name, rules }))
 }
 
-/// `current`, an IPv4 address or CIDR, or a hostname.
+/// `current`, `current6`, an IPv4 or IPv6 address or CIDR, or a hostname.
 fn valid_firewall_source(source: &str) -> bool {
     source == "current"
+        || source == "current6"
         || crate::ip::normalize_ipv4(source).is_ok()
+        || crate::ip::normalize_ipv6(source).is_ok()
         || crate::ip::is_hostname(source)
 }
 
@@ -567,6 +587,7 @@ mod tests {
         assert_eq!(cfg.log.file, "contabo-ddns.log");
         assert_eq!(cfg.tls_roots, TlsRoots::Both);
         assert_eq!(cfg.ip_echo_urls, vec![DEFAULT_IP_ECHO_URL.to_string()]);
+        assert!(!cfg.ipv6);
         let dns = cfg.dns.as_ref().unwrap();
         assert_eq!(
             dns.records,
@@ -834,6 +855,40 @@ mod tests {
         assert_eq!(Config::from_pairs(pairs).unwrap().ip_echo_urls.len(), 2);
 
         let mut pairs = base();
+        pairs.push(("IPV6", "yes"));
+        assert!(Config::from_pairs(pairs).unwrap().ipv6);
+
+        let mut pairs = base();
+        pairs.retain(|(key, _)| *key != "DNS_RECORDS");
+        pairs.push(("DNS_ENABLED", "false"));
+        pairs.push(("FIREWALL_ID", "fw-1"));
+        pairs.push((
+            "FIREWALL_RULES",
+            r#"[{"displayName":"SSH","sources":["2001:db8::1","current6"]}]"#,
+        ));
+        assert!(
+            Config::from_pairs(pairs)
+                .unwrap_err()
+                .to_string()
+                .contains("current6 requires IPV6=true")
+        );
+
+        let mut pairs = base();
+        pairs.retain(|(key, _)| *key != "DNS_RECORDS");
+        pairs.push(("DNS_ENABLED", "false"));
+        pairs.push(("IPV6", "true"));
+        pairs.push(("FIREWALL_ID", "fw-1"));
+        pairs.push((
+            "FIREWALL_RULES",
+            r#"[{"displayName":"SSH","sources":["2001:db8::1","current6"]}]"#,
+        ));
+        let firewall = Config::from_pairs(pairs).unwrap().firewall.unwrap();
+        assert_eq!(
+            firewall.rules[0].sources,
+            vec!["2001:db8::1".to_string(), "current6".to_string()]
+        );
+
+        let mut pairs = base();
         pairs.push(("IP_ECHO_URL", "  "));
         assert!(Config::from_pairs(pairs).is_err());
 
@@ -936,6 +991,7 @@ mod tests {
             ("DNS_TTL", "nope"),
             ("DNS_CREATE_MISSING", "maybe"),
             ("FIREWALL_ENABLED", "maybe"),
+            ("IPV6", "maybe"),
         ] {
             let mut pairs = base();
             if pairs.iter().any(|(existing, _)| *existing == key) {

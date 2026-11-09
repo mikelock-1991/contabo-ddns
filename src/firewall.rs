@@ -1,7 +1,6 @@
-//! Rewrite IPv4 sources on named Contabo firewall inbound rules.
+//! Rewrite IPv4 and IPv6 sources on named Contabo firewall inbound rules.
 
 use std::collections::BTreeSet;
-use std::net::Ipv4Addr;
 use std::sync::Mutex;
 
 use serde_json::{Value, json};
@@ -9,7 +8,7 @@ use serde_json::{Value, json};
 use crate::config::FirewallConfig;
 use crate::contabo::{ContaboClient, encode_path_segment};
 use crate::error::Error;
-use crate::ip::{Resolver, resolve_sources};
+use crate::ip::{PublicIps, Resolver, resolve_sources};
 
 /// Remembers a firewall id looked up by name for the life of the process.
 pub struct FirewallState {
@@ -48,14 +47,15 @@ impl FirewallState {
     }
 }
 
-/// Resolves planned sources, then PUTs inbound rules when IPv4 lists changed.
+/// Resolves planned sources, then PUTs inbound rules when a family list changed.
 ///
-/// Fail-closed: missing rule names, empty resolved lists, or lookup errors skip PUT.
+/// An empty resolved family leaves that `srcCidr` list unchanged. Fail-closed:
+/// missing rule names, empty resolved lists, or lookup errors skip PUT.
 /// A 404 on a name-looked-up id clears `state` and looks the name up once more.
 pub fn sync(
     client: &ContaboClient<'_>,
     cfg: &FirewallConfig,
-    current: Option<Ipv4Addr>,
+    current: PublicIps,
     resolver: &dyn Resolver,
     dry_run: bool,
     state: &FirewallState,
@@ -81,22 +81,31 @@ pub fn sync(
 
     let mut changed = false;
     for rule in &mut updated {
-        let Some(name) = display_name(rule) else {
+        let Some(name) = display_name(rule).map(str::to_string) else {
             continue;
         };
         let Some((_, sources)) = planned
             .iter()
-            .find(|(planned_name, _)| planned_name == name)
+            .find(|(planned_name, _)| planned_name == &name)
         else {
             continue;
         };
-        let old = ipv4_list(rule)?;
-        if same_set(&old, sources) {
+        let old_v4 = ipv4_list(rule)?;
+        let old_v6 = ipv6_list(rule)?;
+        let v4_changed = !sources.v4.is_empty() && !same_set(&old_v4, &sources.v4);
+        let v6_changed = !sources.v6.is_empty() && !same_set(&old_v6, &sources.v6);
+        if !v4_changed && !v6_changed {
             log::info!("firewall unchanged {name}");
             continue;
         }
-        log::info!("firewall update {name} {old:?} -> {sources:?}");
-        set_ipv4(rule, sources)?;
+        if v4_changed {
+            log::info!("firewall update {name} ipv4 {old_v4:?} -> {:?}", sources.v4);
+            set_ipv4(rule, &sources.v4)?;
+        }
+        if v6_changed {
+            log::info!("firewall update {name} ipv6 {old_v6:?} -> {:?}", sources.v6);
+            set_ipv6(rule, &sources.v6)?;
+        }
         changed = true;
     }
     if !changed {
@@ -198,17 +207,26 @@ fn display_name(rule: &Value) -> Option<&str> {
 
 /// Reads `srcCidr.ipv4` strings; missing `srcCidr` is an empty list.
 fn ipv4_list(rule: &Value) -> Result<Vec<String>, Error> {
-    let Some(ipv4) = rule.get("srcCidr").and_then(|src| src.get("ipv4")) else {
+    cidr_list(rule, "ipv4")
+}
+
+/// Reads `srcCidr.ipv6` strings; missing `srcCidr` is an empty list.
+fn ipv6_list(rule: &Value) -> Result<Vec<String>, Error> {
+    cidr_list(rule, "ipv6")
+}
+
+fn cidr_list(rule: &Value, family: &str) -> Result<Vec<String>, Error> {
+    let Some(items) = rule.get("srcCidr").and_then(|src| src.get(family)) else {
         return Ok(Vec::new());
     };
-    let items = ipv4
+    let items = items
         .as_array()
-        .ok_or_else(|| Error::new("srcCidr.ipv4 is not an array"))?;
+        .ok_or_else(|| Error::new(format!("srcCidr.{family} is not an array")))?;
     let mut values = Vec::new();
     for item in items {
         let text = item
             .as_str()
-            .ok_or_else(|| Error::new("srcCidr.ipv4 entry is not a string"))?;
+            .ok_or_else(|| Error::new(format!("srcCidr.{family} entry is not a string")))?;
         values.push(text.to_string());
     }
     Ok(values)
@@ -216,6 +234,15 @@ fn ipv4_list(rule: &Value) -> Result<Vec<String>, Error> {
 
 /// Replaces `srcCidr.ipv4` on a rule, creating `srcCidr` if needed.
 fn set_ipv4(rule: &mut Value, sources: &[String]) -> Result<(), Error> {
+    set_cidr(rule, "ipv4", sources)
+}
+
+/// Replaces `srcCidr.ipv6` on a rule, creating `srcCidr` if needed.
+fn set_ipv6(rule: &mut Value, sources: &[String]) -> Result<(), Error> {
+    set_cidr(rule, "ipv6", sources)
+}
+
+fn set_cidr(rule: &mut Value, family: &str, sources: &[String]) -> Result<(), Error> {
     let object = rule
         .as_object_mut()
         .ok_or_else(|| Error::new("firewall rule is not an object"))?;
@@ -223,7 +250,7 @@ fn set_ipv4(rule: &mut Value, sources: &[String]) -> Result<(), Error> {
     let src_object = src
         .as_object_mut()
         .ok_or_else(|| Error::new("srcCidr is not an object"))?;
-    src_object.insert("ipv4".into(), json!(sources));
+    src_object.insert(family.to_string(), json!(sources));
     Ok(())
 }
 
@@ -237,7 +264,7 @@ fn same_set(left: &[String], right: &[String]) -> bool {
 mod tests {
     use super::*;
     use crate::config::FirewallRuleConfig;
-    use crate::ip::MapResolver;
+    use crate::ip::{MapResolver, PublicIps};
     use crate::test_http::{Scripted, Sequence, TOKEN_BODY, client, token_route};
     use std::net::Ipv4Addr;
 
@@ -287,7 +314,10 @@ mod tests {
             "home.example.net".into(),
             vec![Ipv4Addr::new(203, 0, 113, 9), Ipv4Addr::new(203, 0, 113, 8)],
         );
-        MapResolver { values }
+        MapResolver {
+            values,
+            ..MapResolver::default()
+        }
     }
 
     #[test]
@@ -300,7 +330,7 @@ mod tests {
         sync(
             &client(&http),
             &cfg(vec!["203.0.113.5"]),
-            None,
+            PublicIps::default(),
             &resolver(),
             false,
             &FirewallState::new(),
@@ -322,7 +352,7 @@ mod tests {
             sync(
                 &client(&denied),
                 &cfg(vec!["203.0.113.5"]),
-                None,
+                PublicIps::default(),
                 &resolver(),
                 false,
                 &FirewallState::new(),
@@ -341,7 +371,10 @@ mod tests {
         sync(
             &client(&http),
             &cfg(vec!["home.example.net", "current"]),
-            Some(Ipv4Addr::new(198, 51, 100, 4)),
+            PublicIps {
+                v4: Some(Ipv4Addr::new(198, 51, 100, 4)),
+                ..PublicIps::default()
+            },
             &resolver(),
             false,
             &FirewallState::new(),
@@ -365,6 +398,72 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_ipv6_without_clearing_ipv4() {
+        let http = Scripted::new(vec![
+            token_route(),
+            ("GET", "/v1/firewalls/fw-1", 200, sample_firewall()),
+            ("PUT", "/v1/firewalls/fw-1", 200, r#"{"data":[]}"#.into()),
+        ]);
+        let mut values_v6 = std::collections::HashMap::new();
+        values_v6.insert(
+            "v6.example.net".into(),
+            vec!["2606:4700:4700::64".parse().unwrap()],
+        );
+        let hosts = MapResolver {
+            v6: values_v6,
+            ..resolver()
+        };
+        sync(
+            &client(&http),
+            &cfg(vec!["2606:4700:4700::1111", "v6.example.net", "current6"]),
+            PublicIps {
+                v4: None,
+                v6: Some("2606:4700:4700::10".parse().unwrap()),
+            },
+            &hosts,
+            false,
+            &FirewallState::new(),
+        )
+        .unwrap();
+        let calls = http.calls.lock().unwrap();
+        let put = calls.iter().find(|call| call.method == "PUT").unwrap();
+        let body: Value = serde_json::from_slice(put.body.as_ref().unwrap()).unwrap();
+        let inbound = body["rules"]["inbound"].as_array().unwrap();
+        assert_eq!(inbound[0]["srcCidr"]["ipv4"], json!(["1.1.1.1/32"]));
+        assert_eq!(
+            inbound[0]["srcCidr"]["ipv6"],
+            json!([
+                "2606:4700:4700::10/128",
+                "2606:4700:4700::1111/128",
+                "2606:4700:4700::64/128"
+            ])
+        );
+        assert_eq!(inbound[1]["srcCidr"]["ipv4"], json!(["0.0.0.0/0"]));
+
+        let same = Scripted::new(vec![
+            token_route(),
+            ("GET", "/v1/firewalls/fw-1", 200, sample_firewall()),
+        ]);
+        sync(
+            &client(&same),
+            &cfg(vec!["2001:db8::/64"]),
+            PublicIps::default(),
+            &resolver(),
+            false,
+            &FirewallState::new(),
+        )
+        .unwrap();
+        assert!(
+            same.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|call| call.method != "PUT")
+        );
+        assert!(set_ipv6(&mut json!("nope"), &["2001:db8::1".into()]).is_err());
+    }
+
+    #[test]
     fn skips_put_when_sources_match() {
         let http = Scripted::new(vec![
             token_route(),
@@ -373,7 +472,7 @@ mod tests {
         sync(
             &client(&http),
             &cfg(vec!["1.1.1.1"]),
-            None,
+            PublicIps::default(),
             &resolver(),
             false,
             &FirewallState::new(),
@@ -393,19 +492,19 @@ mod tests {
         let err = sync(
             &client(&http),
             &cfg(vec!["missing.example"]),
-            None,
+            PublicIps::default(),
             &resolver(),
             false,
             &FirewallState::new(),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("no A record"));
+        assert!(err.to_string().contains("no address"));
         let mut named = cfg(vec!["203.0.113.5"]);
         named.rules[0].display_name = "VPN".into();
         let err = sync(
             &client(&http),
             &named,
-            None,
+            PublicIps::default(),
             &resolver(),
             false,
             &FirewallState::new(),
@@ -426,7 +525,7 @@ mod tests {
         sync(
             &client(&http),
             &cfg(vec!["203.0.113.5"]),
-            None,
+            PublicIps::default(),
             &resolver(),
             true,
             &FirewallState::new(),
@@ -453,7 +552,7 @@ mod tests {
         sync(
             &client(&http),
             &named,
-            None,
+            PublicIps::default(),
             &resolver(),
             false,
             &FirewallState::new(),
@@ -466,7 +565,15 @@ mod tests {
         }
 
         let state = FirewallState::new();
-        sync(&client(&http), &named, None, &resolver(), false, &state).unwrap();
+        sync(
+            &client(&http),
+            &named,
+            PublicIps::default(),
+            &resolver(),
+            false,
+            &state,
+        )
+        .unwrap();
         let listed_once = http
             .calls
             .lock()
@@ -474,7 +581,15 @@ mod tests {
             .iter()
             .filter(|call| call.url.contains("name=edge"))
             .count();
-        sync(&client(&http), &named, None, &resolver(), false, &state).unwrap();
+        sync(
+            &client(&http),
+            &named,
+            PublicIps::default(),
+            &resolver(),
+            false,
+            &state,
+        )
+        .unwrap();
         let listed_twice = http
             .calls
             .lock()
@@ -501,7 +616,15 @@ mod tests {
         named.id = None;
         named.name = Some("edge".into());
         let state = FirewallState::new();
-        sync(&client(&http), &named, None, &resolver(), false, &state).unwrap();
+        sync(
+            &client(&http),
+            &named,
+            PublicIps::default(),
+            &resolver(),
+            false,
+            &state,
+        )
+        .unwrap();
         assert_eq!(state.cached().as_deref(), Some("fw-1"));
         state.poison_cache();
         assert_eq!(state.cached().as_deref(), Some("fw-1"));
@@ -546,7 +669,7 @@ mod tests {
                 sync(
                     &client(&http),
                     &named,
-                    None,
+                    PublicIps::default(),
                     &resolver(),
                     false,
                     &FirewallState::new(),
@@ -566,7 +689,7 @@ mod tests {
         sync(
             &client(&http),
             &cfg(vec!["203.0.113.5"]),
-            None,
+            PublicIps::default(),
             &resolver(),
             false,
             &FirewallState::new(),
@@ -587,7 +710,7 @@ mod tests {
         sync(
             &client(&http),
             &cfg(vec!["203.0.113.5"]),
-            None,
+            PublicIps::default(),
             &resolver(),
             false,
             &FirewallState::new(),
@@ -600,7 +723,7 @@ mod tests {
         let err = sync(
             &client(&http),
             &broken,
-            None,
+            PublicIps::default(),
             &resolver(),
             false,
             &FirewallState::new(),
@@ -626,7 +749,7 @@ mod tests {
             let err = sync(
                 &client(&http),
                 &named,
-                None,
+                PublicIps::default(),
                 &resolver(),
                 false,
                 &FirewallState::new(),
@@ -646,7 +769,7 @@ mod tests {
             sync(
                 &client(&http),
                 &cfg(vec!["203.0.113.5"]),
-                None,
+                PublicIps::default(),
                 &resolver(),
                 false,
                 &FirewallState::new(),
@@ -663,7 +786,7 @@ mod tests {
             sync(
                 &client(&http),
                 &cfg(vec!["203.0.113.5"]),
-                None,
+                PublicIps::default(),
                 &resolver(),
                 false,
                 &FirewallState::new(),
@@ -682,7 +805,7 @@ mod tests {
             sync(
                 &client(&http),
                 &cfg(vec!["203.0.113.5"]),
-                None,
+                PublicIps::default(),
                 &resolver(),
                 false,
                 &FirewallState::new(),
@@ -699,7 +822,7 @@ mod tests {
             sync(
                 &client(&http),
                 &cfg(vec!["203.0.113.5"]),
-                None,
+                PublicIps::default(),
                 &resolver(),
                 false,
                 &FirewallState::new(),
@@ -718,7 +841,7 @@ mod tests {
             sync(
                 &client(&http),
                 &cfg(vec!["203.0.113.5"]),
-                None,
+                PublicIps::default(),
                 &resolver(),
                 false,
                 &FirewallState::new(),
@@ -739,7 +862,7 @@ mod tests {
             sync(
                 &client(&http),
                 &cfg(vec!["203.0.113.5"]),
-                None,
+                PublicIps::default(),
                 &resolver(),
                 false,
                 &FirewallState::new(),
@@ -761,12 +884,54 @@ mod tests {
             sync(
                 &client(&http),
                 &cfg(vec!["203.0.113.5"]),
-                None,
+                PublicIps::default(),
                 &resolver(),
                 false,
                 &FirewallState::new(),
             )
             .is_ok()
+        );
+
+        let bad_ipv6 = r#"{"data":[{"firewallId":"fw-1","rules":{"inbound":[
+            {"displayName":"SSH","srcCidr":{"ipv4":["203.0.113.5/32"],"ipv6":"nope"}}
+        ]}}]}"#;
+        let http = Scripted::new(vec![
+            token_route(),
+            ("GET", "/v1/firewalls/fw-1", 200, bad_ipv6.into()),
+        ]);
+        assert!(
+            sync(
+                &client(&http),
+                &cfg(vec!["2606:4700:4700::1"]),
+                PublicIps::default(),
+                &resolver(),
+                false,
+                &FirewallState::new(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("srcCidr.ipv6")
+        );
+
+        let text_src = r#"{"data":[{"firewallId":"fw-1","rules":{"inbound":[
+            {"displayName":"SSH","srcCidr":"text"}
+        ]}}]}"#;
+        let http = Scripted::new(vec![
+            token_route(),
+            ("GET", "/v1/firewalls/fw-1", 200, text_src.into()),
+        ]);
+        assert!(
+            sync(
+                &client(&http),
+                &cfg(vec!["2606:4700:4700::1"]),
+                PublicIps::default(),
+                &resolver(),
+                false,
+                &FirewallState::new(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("srcCidr")
         );
 
         assert!(set_ipv4(&mut json!("nope"), &["203.0.113.5".into()]).is_err());
@@ -778,7 +943,7 @@ mod tests {
             sync(
                 &client(&http),
                 &named,
-                None,
+                PublicIps::default(),
                 &resolver(),
                 false,
                 &FirewallState::new()
@@ -791,7 +956,7 @@ mod tests {
             sync(
                 &client(&http),
                 &cfg(vec!["203.0.113.5"]),
-                None,
+                PublicIps::default(),
                 &resolver(),
                 false,
                 &FirewallState::new(),

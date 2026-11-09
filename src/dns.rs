@@ -1,27 +1,29 @@
-//! PATCH existing A records (and optionally POST missing exact names) to the current IP.
+//! PATCH existing A and AAAA records (and optionally POST missing exact names).
 
 use std::collections::HashSet;
-use std::net::Ipv4Addr;
 
 use serde_json::{Value, json};
 
 use crate::config::{DnsConfig, DnsTarget};
 use crate::contabo::{ContaboClient, encode_path_segment};
 use crate::error::Error;
+use crate::ip::PublicIps;
 
 /// TTL for created records when `DNS_TTL` is unset.
 const DEFAULT_CREATE_TTL: u64 = 300;
 
-/// Updates matching A records to `ip`; optionally creates missing exact names.
+/// Updates matching A and AAAA records; optionally creates missing exact names.
 ///
-/// Wildcards only touch existing A records. TXT and other types are skipped.
+/// A records change only when `ips.v4` is known. AAAA records change only when
+/// `ips.v6` is known. Wildcards only touch existing records. Other types are skipped.
 pub fn sync(
     client: &ContaboClient<'_>,
     cfg: &DnsConfig,
-    ip: Ipv4Addr,
+    ips: PublicIps,
     dry_run: bool,
 ) -> Result<(), Error> {
-    let ip_text = ip.to_string();
+    let v4_text = ips.v4.map(|ip| ip.to_string());
+    let v6_text = ips.v6.map(|ip| ip.to_string());
     let zones = zone_names(client)?;
     let mut errors = Vec::new();
     let mut seen = HashSet::new();
@@ -48,19 +50,24 @@ pub fn sync(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_ascii_uppercase();
-            if record_type != "A" {
+            let desired = match record_type.as_str() {
+                "A" => v4_text.as_deref(),
+                "AAAA" => v6_text.as_deref(),
+                _ => continue,
+            };
+            let Some(ip_text) = desired else {
                 continue;
-            }
+            };
             let Some(name) = record.get("name").and_then(Value::as_str) else {
-                log::warn!("A record in {zone} has no name");
+                log::warn!("{record_type} record in {zone} has no name");
                 continue;
             };
             let fqdn = record_fqdn(name, zone);
             if !target_matches(&fqdn, &cfg.records) {
                 continue;
             }
-            seen.insert(fqdn.clone());
-            mark_targets(&fqdn, &cfg.records, &mut matched_targets);
+            seen.insert((fqdn.clone(), record_type.clone()));
+            mark_targets(&fqdn, &record_type, &cfg.records, &mut matched_targets);
             let current = record
                 .get("data")
                 .and_then(Value::as_str)
@@ -73,7 +80,7 @@ pub fn sync(
             let record_id = match json_id(record.get("recordId")) {
                 Some(id) => id,
                 None => {
-                    errors.push(format!("A record {fqdn} has no recordId"));
+                    errors.push(format!("{record_type} record {fqdn} has no recordId"));
                     continue;
                 }
             };
@@ -81,7 +88,7 @@ pub fn sync(
                 .ttl
                 .or_else(|| record.get("ttl").and_then(Value::as_u64));
             let Some(ttl) = ttl else {
-                errors.push(format!("A record {fqdn} has no ttl"));
+                errors.push(format!("{record_type} record {fqdn} has no ttl"));
                 continue;
             };
             let prio = record.get("prio").and_then(Value::as_i64).unwrap_or(0);
@@ -97,7 +104,7 @@ pub fn sync(
             let body = json!({
                 "ttl": ttl,
                 "prio": prio,
-                "type": "A",
+                "type": record_type,
                 "data": ip_text,
             });
             if let Err(err) = client.patch_json(&path, &body) {
@@ -106,51 +113,76 @@ pub fn sync(
         }
     }
 
+    let families = [("A", v4_text.as_deref()), ("AAAA", v6_text.as_deref())];
     if cfg.create_missing {
         for target in &cfg.records {
             let DnsTarget::Exact(host) = target else {
                 continue;
             };
-            if seen.contains(host) {
+            let missing: Vec<(&str, &str)> = families
+                .into_iter()
+                .filter_map(|(kind, ip_text)| {
+                    let ip_text = ip_text?;
+                    if seen.contains(&(host.clone(), kind.to_string())) {
+                        return None;
+                    }
+                    Some((kind, ip_text))
+                })
+                .collect();
+            if missing.is_empty() {
                 continue;
             }
             let Some(zone) = longest_zone(host, &zones) else {
                 errors.push(format!("no zone for {host}"));
                 continue;
             };
-            let name = relative_name(host, zone);
-            let ttl = cfg.ttl.unwrap_or(DEFAULT_CREATE_TTL);
-            log::info!("dns create {host} -> {ip_text}");
-            if dry_run {
-                log::info!("dry-run: skip POST {host}");
-                continue;
-            }
-            let body = json!({
-                "name": name,
-                "type": "A",
-                "ttl": ttl,
-                "prio": 0,
-                "data": ip_text,
-            });
-            let path = format!("/v1/dns/zones/{}/records", encode_path_segment(zone));
-            if let Err(err) = client.post_json(&path, &body) {
-                errors.push(format!("create {host}: {err}"));
+            for (kind, ip_text) in missing {
+                let name = relative_name(host, zone);
+                let ttl = cfg.ttl.unwrap_or(DEFAULT_CREATE_TTL);
+                log::info!("dns create {kind} {host} -> {ip_text}");
+                if dry_run {
+                    log::info!("dry-run: skip POST {host}");
+                    continue;
+                }
+                let body = json!({
+                    "name": name,
+                    "type": kind,
+                    "ttl": ttl,
+                    "prio": 0,
+                    "data": ip_text,
+                });
+                let path = format!("/v1/dns/zones/{}/records", encode_path_segment(zone));
+                if let Err(err) = client.post_json(&path, &body) {
+                    errors.push(format!("create {kind} {host}: {err}"));
+                }
             }
         }
     } else {
         for target in &cfg.records {
-            if let DnsTarget::Exact(host) = target
-                && !seen.contains(host)
-            {
-                log::warn!("no A record for {host}");
+            let DnsTarget::Exact(host) = target else {
+                continue;
+            };
+            for (kind, ip_text) in families {
+                if ip_text.is_none() {
+                    continue;
+                }
+                if !seen.contains(&(host.clone(), kind.to_string())) {
+                    log::warn!("no {kind} record for {host}");
+                }
             }
         }
     }
     for target in &cfg.records {
-        if let DnsTarget::Wildcard(parent) = target
-            && !matched_targets.contains(&format!("*.{parent}"))
-        {
-            log::warn!("wildcard *.{parent} matched no A records");
+        let DnsTarget::Wildcard(parent) = target else {
+            continue;
+        };
+        for (kind, ip_text) in families {
+            if ip_text.is_none() {
+                continue;
+            }
+            if !matched_targets.contains(&format!("*.{parent}|{kind}")) {
+                log::warn!("wildcard *.{parent} matched no {kind} records");
+            }
         }
     }
 
@@ -207,13 +239,13 @@ fn target_matches(fqdn: &str, targets: &[DnsTarget]) -> bool {
     targets.iter().any(|target| hits(fqdn, target))
 }
 
-/// Records which configured targets actually matched an existing A record.
-fn mark_targets(fqdn: &str, targets: &[DnsTarget], matched: &mut HashSet<String>) {
+/// Records which configured targets actually matched an existing record of `kind`.
+fn mark_targets(fqdn: &str, kind: &str, targets: &[DnsTarget], matched: &mut HashSet<String>) {
     for target in targets {
         if hits(fqdn, target) {
             matched.insert(match target {
-                DnsTarget::Exact(host) => host.clone(),
-                DnsTarget::Wildcard(parent) => format!("*.{parent}"),
+                DnsTarget::Exact(host) => format!("{host}|{kind}"),
+                DnsTarget::Wildcard(parent) => format!("*.{parent}|{kind}"),
             });
         }
     }
@@ -274,7 +306,16 @@ mod tests {
 
     use super::*;
     use crate::contabo::HttpRequest;
+    use crate::ip::PublicIps;
     use crate::test_http::{Scripted, client, token_route};
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn v4(ip: Ipv4Addr) -> PublicIps {
+        PublicIps {
+            v4: Some(ip),
+            v6: None,
+        }
+    }
 
     fn zones(body: &str) -> (&'static str, &'static str, u16, String) {
         ("GET", "/v1/dns/zones?", 200, body.into())
@@ -347,7 +388,8 @@ mod tests {
         let records = r#"{"_pagination":{"page":1,"totalPages":1},"data":[
             {"recordId":1,"name":"home","type":"A","ttl":3600,"prio":0,"data":"1.1.1.1"},
             {"recordId":2,"name":"www","type":"A","ttl":120,"prio":0,"data":"203.0.113.10"},
-            {"recordId":3,"name":"home","type":"TXT","ttl":120,"prio":0,"data":"keep"}
+            {"recordId":3,"name":"home","type":"TXT","ttl":120,"prio":0,"data":"keep"},
+            {"recordId":4,"name":"home","type":"AAAA","ttl":120,"prio":0,"data":"2606:4700:4700::1"}
         ]}"#;
         let http = Scripted::new(vec![
             token_route(),
@@ -368,7 +410,7 @@ mod tests {
                 false,
                 Some(60),
             ),
-            Ipv4Addr::new(203, 0, 113, 10),
+            v4(Ipv4Addr::new(203, 0, 113, 10)),
             false,
         )
         .unwrap();
@@ -380,6 +422,100 @@ mod tests {
         assert_eq!(body["ttl"], 60);
         assert_eq!(body["type"], "A");
         assert!(calls.iter().all(|call| !call.url.contains("/records/3")));
+        assert!(calls.iter().all(|call| !call.url.contains("/records/4")));
+    }
+
+    #[test]
+    fn patches_aaaa_and_creates_missing_aaaa() {
+        let records = r#"{"data":[
+            {"recordId":1,"name":"home","type":"A","ttl":60,"prio":0,"data":"203.0.113.10"},
+            {"recordId":2,"name":"home","type":"aaaa","ttl":60,"prio":1,"data":"2606:4700:4700::1"},
+            {"type":"AAAA","ttl":60,"data":"2606:4700:4700::2"}
+        ]}"#;
+        let http = Scripted::new(vec![
+            token_route(),
+            zones(r#"{"data":[{"zoneName":"example.com"}]}"#),
+            ("GET", "/records", 200, records.into()),
+            ("PATCH", "/records/2", 200, r#"{"data":[]}"#.into()),
+            ("POST", "/records", 200, r#"{"data":[]}"#.into()),
+        ]);
+        let api = client(&http);
+        let ips = PublicIps {
+            v4: None,
+            v6: Some("2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap()),
+        };
+        sync(
+            &api,
+            &cfg(
+                vec![
+                    DnsTarget::Exact("home.example.com".into()),
+                    DnsTarget::Exact("new.example.com".into()),
+                    DnsTarget::Wildcard("example.com".into()),
+                ],
+                true,
+                None,
+            ),
+            ips,
+            false,
+        )
+        .unwrap();
+        let calls = calls_of(&http);
+        let patch = calls.iter().find(|call| call.method == "PATCH").unwrap();
+        let body: Value = serde_json::from_slice(patch.body.as_ref().unwrap()).unwrap();
+        assert_eq!(body["type"], "AAAA");
+        assert_eq!(body["data"], "2606:4700:4700::1111");
+        assert_eq!(body["prio"], 1);
+        assert_eq!(body["ttl"], 60);
+        let posts: Vec<_> = calls
+            .iter()
+            .filter(|call| call.method == "POST" && call.url.contains("/records"))
+            .collect();
+        assert_eq!(posts.len(), 1);
+        let created: Value = serde_json::from_slice(posts[0].body.as_ref().unwrap()).unwrap();
+        assert_eq!(created["type"], "AAAA");
+        assert_eq!(created["name"], "new");
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.method != "PATCH" || call.url.contains("/records/2"))
+        );
+    }
+
+    #[test]
+    fn warns_when_aaaa_is_missing_and_skips_unchanged() {
+        let records = r#"{"data":[
+            {"recordId":2,"name":"home","type":"AAAA","ttl":60,"data":"2606:4700:4700::1111"}
+        ]}"#;
+        let http = Scripted::new(vec![
+            token_route(),
+            zones(r#"{"data":[{"zoneName":"example.com"}]}"#),
+            ("GET", "/records", 200, records.into()),
+        ]);
+        let api = client(&http);
+        sync(
+            &api,
+            &cfg(
+                vec![
+                    DnsTarget::Exact("home.example.com".into()),
+                    DnsTarget::Exact("missing.example.com".into()),
+                    DnsTarget::Wildcard("other.example".into()),
+                ],
+                false,
+                None,
+            ),
+            PublicIps {
+                v4: Some(Ipv4Addr::new(203, 0, 113, 10)),
+                v6: Some("2606:4700:4700::1111".parse().unwrap()),
+            },
+            true,
+        )
+        .unwrap();
+        let calls = calls_of(&http);
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.method == "GET" || call.url.contains("/token"))
+        );
     }
 
     #[test]
@@ -404,7 +540,7 @@ mod tests {
         sync(
             &api,
             &cfg(vec![DnsTarget::Wildcard("example.com".into())], true, None),
-            Ipv4Addr::new(203, 0, 113, 7),
+            v4(Ipv4Addr::new(203, 0, 113, 7)),
             true,
         )
         .unwrap();
@@ -438,7 +574,7 @@ mod tests {
                 true,
                 None,
             ),
-            Ipv4Addr::new(203, 0, 113, 4),
+            v4(Ipv4Addr::new(203, 0, 113, 4)),
             false,
         )
         .unwrap();
@@ -470,7 +606,7 @@ mod tests {
         sync(
             &api,
             &cfg(vec![DnsTarget::Exact("example.com".into())], true, None),
-            Ipv4Addr::new(203, 0, 113, 4),
+            v4(Ipv4Addr::new(203, 0, 113, 4)),
             false,
         )
         .unwrap();
@@ -499,7 +635,7 @@ mod tests {
                 false,
                 None,
             ),
-            Ipv4Addr::new(1, 2, 3, 4),
+            v4(Ipv4Addr::new(1, 2, 3, 4)),
             false,
         )
         .unwrap_err();
@@ -532,7 +668,7 @@ mod tests {
                 false,
                 None,
             ),
-            Ipv4Addr::new(203, 0, 113, 99),
+            v4(Ipv4Addr::new(203, 0, 113, 99)),
             false,
         )
         .unwrap_err();
@@ -554,11 +690,11 @@ mod tests {
                 true,
                 Some(60),
             ),
-            Ipv4Addr::new(9, 9, 9, 9),
+            v4(Ipv4Addr::new(9, 9, 9, 9)),
             false,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("create new.example.com"));
+        assert!(err.to_string().contains("create A new.example.com"));
 
         sync(
             &api,
@@ -567,7 +703,7 @@ mod tests {
                 true,
                 None,
             ),
-            Ipv4Addr::new(1, 1, 1, 1),
+            v4(Ipv4Addr::new(1, 1, 1, 1)),
             true,
         )
         .unwrap_err();
@@ -579,7 +715,7 @@ mod tests {
                 false,
                 None,
             ),
-            Ipv4Addr::new(8, 8, 8, 8),
+            v4(Ipv4Addr::new(8, 8, 8, 8)),
             true,
         )
         .unwrap();
@@ -609,7 +745,7 @@ mod tests {
                 true,
                 Some(120),
             ),
-            Ipv4Addr::new(198, 51, 100, 1),
+            v4(Ipv4Addr::new(198, 51, 100, 1)),
             true,
         )
         .unwrap();
@@ -641,7 +777,7 @@ mod tests {
                 false,
                 None,
             ),
-            Ipv4Addr::new(198, 51, 100, 7),
+            v4(Ipv4Addr::new(198, 51, 100, 7)),
             false,
         )
         .unwrap();

@@ -88,7 +88,7 @@ fn after_log_init(cfg: config::Config, delay: fn(u32) -> Duration) -> ExitCode {
         }
     };
     log::info!("healthcheck listening on {}", server.addr());
-    let http = contabo::ReqwestHttp::new(cfg.tls_roots);
+    let http = contabo::ReqwestHttp::new(cfg.tls_roots, cfg.ipv6);
     let code = after_client(cfg, http, delay);
     drop(server);
     code
@@ -409,9 +409,7 @@ mod tests {
         let http = crate::test_http::DnsCycleOk {
             calls: Mutex::new(Vec::new()),
         };
-        let resolver = MapResolver {
-            values: std::collections::HashMap::new(),
-        };
+        let resolver = MapResolver::default();
         let client = ContaboClient::from_config(&http, &cfg).with_delay(crate::retry::immediate);
         run_cycle(
             &cfg,
@@ -503,7 +501,7 @@ mod tests {
         assert_eq!(
             after_client(
                 against_closing_endpoint(sample("0", "true")),
-                ReqwestHttp::new(crate::config::TlsRoots::Both),
+                ReqwestHttp::new(crate::config::TlsRoots::Both, false),
                 crate::retry::immediate,
             ),
             ExitCode::from(1)
