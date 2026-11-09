@@ -68,6 +68,11 @@ jobs:
             echo "update_type=minor" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Install QEMU for arm64 package checks
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - id: apply-updates
         name: Check and apply dependency updates
         env:
@@ -229,6 +234,135 @@ jobs:
             sed -i -E "s/(toolchain: ['\"])[0-9]+\\.[0-9]+\\.[0-9]+(['\"])/\\1${rust_version}\\2/" "$workflow"
             rust_changed=true
           done
+
+          # Move the builder's apt pins to the candidate apt would install in
+          # that image. Both architectures must agree, and the candidate must
+          # install, before the Dockerfile changes.
+          echo "${DOCKERHUB_TOKEN}" | docker login dhi.io --username "${DOCKERHUB_USERNAME}" --password-stdin
+          python3 - << 'PY' > "$RUNNER_TEMP/apt-packages.txt"
+          import re
+          from pathlib import Path
+
+          found = []
+          grab = False
+          for line in Path("Dockerfile").read_text().splitlines():
+              if "apt-get install" in line:
+                  grab = True
+                  continue
+              if not grab:
+                  continue
+              stripped = line.strip()[:-1].strip() if line.strip().endswith("\\") else line.strip()
+              match = re.fullmatch(r"([a-z0-9][a-z0-9.+-]*)=(\S+)", stripped)
+              if match:
+                  found.append(f"{match.group(1)} {match.group(2)}")
+                  continue
+              break
+          if not found:
+              raise SystemExit("no apt pins found in Dockerfile")
+          print("\n".join(found))
+          PY
+          mapfile -t apt_packages < <(awk '{ print $1 }' "$RUNNER_TEMP/apt-packages.txt")
+          apt_candidates() {
+            local platform="$1"
+            shift
+            docker run --rm --user root --platform "$platform" --entrypoint sh \
+              "dhi.io/rust:${rust_pinned}" -c '
+                set -eu
+                apt-get update -qq
+                for pkg in "$@"; do
+                  ver="$(apt-cache policy "$pkg" | awk "/Candidate:/ { print \$2; exit }")"
+                  printf "%s %s\n" "$pkg" "$ver"
+                done
+              ' sh "$@"
+          }
+          apt_candidates linux/amd64 "${apt_packages[@]}" > "$RUNNER_TEMP/apt-amd64.txt"
+          apt_candidates linux/arm64 "${apt_packages[@]}" > "$RUNNER_TEMP/apt-arm64.txt"
+          if ! diff -q "$RUNNER_TEMP/apt-amd64.txt" "$RUNNER_TEMP/apt-arm64.txt" >/dev/null; then
+            echo "::error::apt candidates differ between linux/amd64 and linux/arm64"
+            diff -u "$RUNNER_TEMP/apt-amd64.txt" "$RUNNER_TEMP/apt-arm64.txt" || true
+            exit 1
+          fi
+          if [ "$(wc -l < "$RUNNER_TEMP/apt-amd64.txt")" -ne "${#apt_packages[@]}" ]; then
+            echo "::error::apt candidate query returned an unexpected package list"
+            cat "$RUNNER_TEMP/apt-amd64.txt"
+            exit 1
+          fi
+          while read -r pkg ver; do
+            if ! [[ "$pkg" =~ ^[a-z0-9][a-z0-9.+-]*$ && "$ver" =~ ^[0-9][A-Za-z0-9.+~:-]*$ ]]; then
+              echo "::error::Unexpected apt candidate for ${pkg:-empty}: ${ver:-empty}"
+              exit 1
+            fi
+          done < "$RUNNER_TEMP/apt-amd64.txt"
+          if ! diff -q "$RUNNER_TEMP/apt-packages.txt" "$RUNNER_TEMP/apt-amd64.txt" >/dev/null; then
+            apt_install() {
+              local platform="$1"
+              shift
+              docker run --rm --user root --platform "$platform" --entrypoint sh \
+                "dhi.io/rust:${rust_pinned}" -c '
+                  set -eu
+                  apt-get update -qq
+                  apt-get install -y --no-install-recommends "$@"
+                ' sh "$@"
+            }
+            install_args=()
+            while read -r pkg ver; do
+              install_args+=("${pkg}=${ver}")
+            done < "$RUNNER_TEMP/apt-amd64.txt"
+            apt_install linux/amd64 "${install_args[@]}"
+            apt_install linux/arm64 "${install_args[@]}"
+            APT_CANDIDATES="$RUNNER_TEMP/apt-amd64.txt" python3 - << 'PY' | tee -a "$report_file"
+          import os
+          import re
+          from pathlib import Path
+
+          pins = {}
+          for line in Path(os.environ["APT_CANDIDATES"]).read_text().splitlines():
+              if not line.strip():
+                  continue
+              pkg, ver = line.split(" ", 1)
+              pins[pkg] = ver
+
+          path = Path("Dockerfile")
+          original = path.read_text().splitlines(keepends=True)
+          grab = False
+          seen = set()
+          changes = []
+          updated = []
+          for line in original:
+              if "apt-get install" in line:
+                  grab = True
+                  updated.append(line)
+                  continue
+              if grab:
+                  raw = line.strip()
+                  body = raw[:-1].strip() if raw.endswith("\\") else raw
+                  match = re.fullmatch(r"([a-z0-9][a-z0-9.+-]*)=(\S+)", body)
+                  if match:
+                      pkg, old = match.group(1), match.group(2)
+                      new = pins[pkg]
+                      seen.add(pkg)
+                      if old != new:
+                          changes.append((pkg, old, new))
+                          indent = line[: len(line) - len(line.lstrip(" "))]
+                          cont = " \\" if raw.endswith("\\") else ""
+                          newline = "\n" if line.endswith("\n") else ""
+                          line = f"{indent}{pkg}={new}{cont}{newline}"
+                      updated.append(line)
+                      continue
+                  grab = False
+              updated.append(line)
+
+          missing = sorted(set(pins) - seen)
+          if missing:
+              raise SystemExit("pins not rewritten: " + ", ".join(missing))
+          if not changes:
+              raise SystemExit("apt candidates differed but no Dockerfile pin changed")
+          path.write_text("".join(updated))
+          print("\n## Builder packages\n")
+          for pkg, old, new in changes:
+              print(f"- `{pkg}` `{old}` -> `{new}`")
+          PY
+          fi
 
           # Pin the runtime to the newest plain Debian 13 static image (no glibc, no FIPS). nonroot is uid 65532.
           static_token="$(dhi_token static)" || {
