@@ -1,16 +1,50 @@
 # contabo-ddns
 
-Container that updates Contabo DNS A records and the IPv4 sources of named firewall rules. Run it on the network whose public address should be published. On the Contabo VPS, the echo service returns the VPS address. At home, it returns the home address.
+Rust program that updates Contabo DNS A records and the IPv4 sources of named firewall rules. The published container is a static binary on a [Docker Hardened Image](https://docs.docker.com/dhi/). Run it on the network whose public address should be published. On the Contabo VPS, the echo service returns the VPS address. At home, it returns the home address.
 
-## Image
+## Run the published image
 
-The runtime image is [distroless static](https://github.com/GoogleContainerTools/distroless) Debian 13, tag `nonroot` (`gcr.io/distroless/static-debian13:nonroot`). That base is not a Linux distribution you can log into. It has a CA certificate bundle, a `nonroot` user, and nothing else: no shell, no package manager, and no extra libraries.
+Pull a published tag. That pull does not use `dhi.io`. `latest` tracks `main` and is a multi-architecture image for `linux/amd64` and `linux/arm64`, including Apple Silicon. The same tags are on GHCR and Docker Hub:
 
-The program is copied in as one statically linked musl binary. The image also contains `/var/log/contabo-ddns`, owned by uid **65532** (gid 65532). That is the only path the process can write. A host bind mount for logs must be writable by uid 65532.
+- `ghcr.io/mikelock-1991/contabo-ddns`
+- `docker.io/mikelockengineering/contabo-ddns`
 
-`docker exec` and `podman exec` cannot open a shell in this image. Read the container log, or the files in the log volume. Compose sets `init: true` because the image has no init process of its own. It also sets a read-only root filesystem, drops all capabilities, and sets `no-new-privileges`.
+```sh
+cp .env.example .env
+```
 
-`TLS_ROOTS=both` uses the Mozilla roots built into the binary and the CA bundle from the distroless image. `webpki` uses only the built-in roots. `native` uses only the bundle.
+Fill in the four Contabo credentials. Save this next to `.env` as `compose.yaml`. If this repository is already checked out, remove `build` from the existing file and set `image` as shown.
+
+```yaml
+services:
+  contabo-ddns:
+    image: docker.io/mikelockengineering/contabo-ddns:latest
+    init: true
+    env_file:
+      - .env
+    volumes:
+      - contabo-ddns-logs:/var/log/contabo-ddns
+    restart: unless-stopped
+    stop_grace_period: 45s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  contabo-ddns-logs:
+```
+
+```sh
+docker compose up -d
+```
+
+Podman uses the same file: `podman compose up -d`. Log in to `ghcr.io` first when that package is private, then set `image` to `ghcr.io/mikelock-1991/contabo-ddns:latest`.
+
+The image healthcheck runs `contabo-ddns health` every 30 seconds. Inside the container that is `GET /health` on `127.0.0.1:8080`, and the body `ok` means healthy. Do not publish the port. `HEALTHCHECK_BIND` can select another loopback address. Any other address is rejected. After the 15 second start period, `docker compose ps` shows `healthy`.
+
+Follow the log with `docker compose logs -f`.
 
 ## Configure
 
@@ -52,18 +86,39 @@ At least one of DNS or the firewall must be enabled. Booleans accept `true`/`fal
 | `LOG_ROTATE_SIZE_MB`      | `10`                              | Megabytes before the file rolls. At least 1.                                                                                 |
 | `LOG_ROTATE_KEEP`         | `5`                               | Rolled files to keep, from 1 to 10000.                                                                                       |
 | `LOG_TO_STDOUT`           | `true`                            | `false` requires a non-empty `LOG_DIR`.                                                                                      |
+| `HEALTHCHECK_BIND`        | `127.0.0.1:8080`                  | Loopback address for `GET /health`. A non-loopback address is rejected. Do not publish the port.                             |
 
 `home.example.com` updates that A record. `example.com` is the zone apex and is written as `@`. `*.example.com` updates existing A records in that zone and its children. Wildcards do not create records. Other record types are left alone.
 
 A firewall source is an IPv4 address, an IPv4 CIDR, a hostname, or `current`. A hostname contributes one `/32` per A record. `current` is the address returned by `IP_ECHO_URL`. Set exactly one of `FIREWALL_ID` or `FIREWALL_NAME`. Duplicate sources are dropped and the remaining order is kept.
 
-`TLS_ROOTS=both` uses the embedded Mozilla roots and the distroless CA bundle. `webpki` uses only the embedded roots. `native` uses only the bundle.
+`TLS_ROOTS=both` uses the embedded Mozilla roots and the image CA bundle. `webpki` uses only the embedded roots. `native` uses only the bundle.
 
 Echo answers that are private, loopback, link-local, carrier-grade NAT (`100.64.0.0/10`), or benchmarking (`198.18.0.0/15`) are skipped.
 
+## Image
+
+The runtime image is a [Docker Hardened Image](https://docs.docker.com/dhi/), `dhi.io/static`, Debian 13. That base is not a Linux distribution you can log into. It has a CA certificate bundle, a `nonroot` user, and nothing else: no shell, no package manager, and no extra libraries.
+
+The program is Rust, copied in as one statically linked musl binary. Published tags are multi-architecture manifests for `linux/amd64` and `linux/arm64`, so Apple Silicon and other arm64 hosts pull the arm64 image. A local `docker build` uses the machine's own architecture. The image also contains `/var/log/contabo-ddns`, owned by uid **65532** (gid 65532). That is the only path the process can write. A host bind mount for logs must be writable by uid 65532.
+
+The healthcheck runs `/usr/local/bin/contabo-ddns health`. The image has no shell and no curl, so Docker calls the binary. It requests `GET /health` on `HEALTHCHECK_BIND` and expects the body `ok`.
+
+Building the image pulls the builder and the runtime from `dhi.io`. That requires a free Docker Hub account:
+
+```sh
+docker login dhi.io
+```
+
+Podman uses `podman login dhi.io`. The published image is a normal image on GHCR and Docker Hub. Pulling `latest` or a version tag does not use `dhi.io`.
+
+`docker exec` and `podman exec` cannot open a shell in this image. Read the container log, or the files in the log volume. Compose sets `init: true` because the image has no init process of its own. It also sets a read-only root filesystem, drops all capabilities, and sets `no-new-privileges`.
+
+`TLS_ROOTS=both` uses the Mozilla roots built into the binary and the CA bundle from the image. `webpki` uses only the built-in roots. `native` uses only the bundle.
+
 ## Run
 
-From this directory, with `.env` in place:
+This builds from source. Pulling a published image is described above. Log in to `dhi.io` before the first build. From this directory, with `.env` in place:
 
 ```sh
 podman compose up -d --build
@@ -77,7 +132,16 @@ docker compose up -d --build
 
 Compose names the image `contabo-ddns`, restarts it unless it is stopped, and mounts the `contabo-ddns-logs` volume on `/var/log/contabo-ddns`. `stop_grace_period` is 45 seconds, which is longer than one 30 second HTTP timeout.
 
-A published image is `ghcr.io/mikelock-1991/contabo-ddns` and `docker.io/mikelockengineering/contabo-ddns`. `latest` tracks `main` and is also tagged with the `Cargo.toml` version, for example `0.1.4`. Every push to `dev`, including a merged pull request, publishes a new prerelease `0.1.4-beta.1`, `0.1.4-beta.2`, and so on. The moving tag for that series is `beta`. After `v0.1.4` exists on `main`, the next `dev` publish starts at `0.1.5-beta.1`. The deploy workflow logs in to Docker Hub with the `DOCKERHUB_USERNAME` variable and the `DOCKERHUB_TOKEN` secret (a Docker Hub access token with write access). Set both on the repository, or on the `main` and `dev` environments.
+A published image is `ghcr.io/mikelock-1991/contabo-ddns` and `docker.io/mikelockengineering/contabo-ddns`. `latest` tracks `main` and is also tagged with the `Cargo.toml` version, for example `0.1.4`. Every push to `dev`, including a merged pull request, publishes a new prerelease `0.1.4-beta.1`, `0.1.4-beta.2`, and so on. The moving tag for that series is `beta`. After `v0.1.4` exists on `main`, the next `dev` publish starts at `0.1.5-beta.1`. The deploy workflow logs in to Docker Hub with the `DOCKERHUB_USERNAME` variable and the `DOCKERHUB_TOKEN` secret (a Docker Hub access token with write access). Set both on the repository, or on the `main` and `dev` environments. The same credentials log in to `dhi.io` so the build can pull the hardened base. The finished image is pushed to Docker Hub and to GHCR. The deploy workflow signs each copy with Sigstore, using the GitHub Actions identity for `.github/workflows/deploy.yml`. No signing key is stored. Check a tag before running it:
+
+```sh
+cosign verify \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github.com/mikelock-1991/contabo-ddns/\.github/workflows/deploy\.yml@' \
+  ghcr.io/mikelock-1991/contabo-ddns:latest
+```
+
+The Docker Hub tag uses the same command with `docker.io/mikelockengineering/contabo-ddns:latest`.
 
 After the image starts and exits 2 with an empty environment, the workflow creates or updates GitHub Release `v<version>` on the commit that was built. A `dev` publish stays a prerelease. A `main` publish marks that same release as the latest. The notes are regenerated on every publish from the commits since the previous version tag. The automatic patch-bump commit is omitted. Log in first when the GitHub package is private:
 

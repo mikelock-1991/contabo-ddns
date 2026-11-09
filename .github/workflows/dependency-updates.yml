@@ -30,6 +30,7 @@ jobs:
   update-deps:
     name: Update dependencies
     runs-on: ubuntu-latest
+    environment: dev
     steps:
       - name: Create pipeline app token
         id: app-token
@@ -67,52 +68,157 @@ jobs:
             echo "update_type=minor" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Install QEMU for arm64 package checks
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - id: apply-updates
         name: Check and apply dependency updates
         env:
           UPDATE_TYPE: ${{ steps.resolve-type.outputs.update_type }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           report_file="$RUNNER_TEMP/cargo-upgrade.md"
-          # Cargo.toml keeps exact "=" requirements. --pinned moves those to the new version.
+          # Cargo.toml keeps exact "=" requirements. cargo-edit 0.13's --pinned
+          # moves those pins to the newest release, including incompatible ones.
+          # That is the monthly major path. A minor run must stay inside semver
+          # compatibility, or reqwest 0.13 drops rustls-tls-native-roots and the
+          # build fails.
           if [ "$UPDATE_TYPE" = "major" ]; then
             echo '## Major updates' > "$report_file"
             cargo upgrade --dry-run --pinned --incompatible | tee -a "$report_file"
             cargo upgrade --pinned --incompatible
           else
             echo '## Compatible updates' > "$report_file"
-            cargo upgrade --dry-run --pinned | tee -a "$report_file"
-            cargo upgrade --pinned
+            python3 - << 'PY' | tee -a "$report_file"
+          import json, re, subprocess
+          from pathlib import Path
+
+          manifest = Path("Cargo.toml")
+          lines = manifest.read_text().splitlines(keepends=True)
+          updated = []
+          in_dependencies = False
+          changes = []
+
+          def parse_version(version):
+              return tuple(int(part) for part in version.split("."))
+
+          def is_compatible(current, candidate):
+              current_parts = parse_version(current)
+              candidate_parts = parse_version(candidate)
+              if candidate_parts < current_parts:
+                  return False
+              if current_parts[0] == 0 and current_parts[1] == 0:
+                  return candidate_parts == current_parts
+              if current_parts[0] == 0:
+                  return candidate_parts[0] == 0 and candidate_parts[1] == current_parts[1]
+              return candidate_parts[0] == current_parts[0]
+
+          for line in lines:
+              stripped = line.strip()
+              if stripped == "[dependencies]":
+                  in_dependencies = True
+                  updated.append(line)
+                  continue
+              if in_dependencies and stripped.startswith("["):
+                  in_dependencies = False
+              pin = re.search(r'"=([0-9]+\.[0-9]+\.[0-9]+)"', line)
+              if not in_dependencies or pin is None or stripped.startswith("#"):
+                  updated.append(line)
+                  continue
+              name = line.split("=", 1)[0].strip()
+              current = pin.group(1)
+              listing = subprocess.check_output(
+                  [
+                      "curl", "-fsSL", "-A", "contabo-ddns-dependency-updates",
+                      f"https://crates.io/api/v1/crates/{name}",
+                  ],
+                  text=True,
+              )
+              best = current
+              for item in json.loads(listing)["versions"]:
+                  if item.get("yanked"):
+                      continue
+                  number = item["num"]
+                  if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", number):
+                      continue
+                  if is_compatible(current, number) and parse_version(number) > parse_version(best):
+                      best = number
+              if best != current:
+                  line = line.replace(f'"={current}"', f'"={best}"', 1)
+                  changes.append((name, current, best))
+              updated.append(line)
+
+          manifest.write_text("".join(updated))
+          print(f"{'name':<16} {'old req':<12} new req")
+          print(f"{'====':<16} {'=======':<12} =======")
+          if not changes:
+              print("no compatible updates")
+          for name, old, new in changes:
+              print(f"{name:<16} ={old:<11} ={new}")
+          PY
+            cargo update
           fi
 
-          # Pin the builder to the newest stable Rust and the digest of its bookworm image.
-          rust_version="$(curl -fsSL "https://static.rust-lang.org/dist/channel-rust-stable.toml" | awk '
+          # Pin the builder to the newest stable Rust Docker Hardened Image and its manifest-list digest.
+          # dhi.io rejects anonymous tokens. The same Docker Hub credentials used to publish the image can pull.
+          if [ -z "${DOCKERHUB_USERNAME}" ] || [ -z "${DOCKERHUB_TOKEN}" ]; then
+            echo "::error::DOCKERHUB_USERNAME and DOCKERHUB_TOKEN are required to pin dhi.io images"
+            exit 1
+          fi
+          dhi_token() {
+            local repo="$1"
+            local body token
+            body="$(curl -fsSL --user "${DOCKERHUB_USERNAME}:${DOCKERHUB_TOKEN}" \
+              "https://dhi.io/token?service=registry.docker.io&scope=repository:${repo}:pull")" || return 1
+            token="$(printf '%s\n' "$body" | jq -r '.token // .access_token // empty')" || return 1
+            if [ -z "$token" ] || [ "$token" = "null" ]; then
+              return 1
+            fi
+            printf '%s\n' "$token"
+          }
+          dhi_index_digest() {
+            local repo="$1"
+            local tag="$2"
+            local token="$3"
+            curl -fsSL -D - -o /dev/null \
+              -H "Authorization: Bearer ${token}" \
+              -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
+              "https://dhi.io/v2/${repo}/manifests/${tag}" \
+              | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:" { print $2; exit }'
+          }
+          channel_toml="$(mktemp)"
+          curl -fsSL "https://static.rust-lang.org/dist/channel-rust-stable.toml" -o "$channel_toml"
+          rust_version="$(awk '
             $0 == "[pkg.rust]" { in_rust = 1; next }
             in_rust && /^version = / { gsub(/"/, "", $3); print $3; exit }
             in_rust && /^\[/ { exit }
-          ')"
+          ' "$channel_toml")"
           if ! [[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Unexpected Rust version: ${rust_version:-empty}"
             exit 1
           fi
-          token="$(curl -fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/rust:pull" | jq -r '.token')"
-          rust_digest="$(curl -fsSL -D - -o /dev/null \
-            -H "Authorization: Bearer ${token}" \
-            -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
-            "https://registry-1.docker.io/v2/library/rust/manifests/${rust_version}-bookworm" \
-            | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:" { print $2; exit }')"
+          rust_token="$(dhi_token rust)" || {
+            echo "::error::dhi.io token request failed for rust"
+            exit 1
+          }
+          rust_tag="${rust_version}-debian13-dev"
+          rust_digest="$(dhi_index_digest rust "$rust_tag" "$rust_token" || true)"
           if ! [[ "$rust_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::Unexpected Rust image digest: ${rust_digest:-empty}"
+            echo "::error::Unexpected Rust image digest for ${rust_tag}: ${rust_digest:-empty}"
             exit 1
           fi
-          rust_pinned="${rust_version}-bookworm@${rust_digest}"
-          rust_current="$(sed -n 's/^FROM rust:\([^ ]*\).*/\1/p' Dockerfile | head -1)"
+          rust_pinned="${rust_tag}@${rust_digest}"
+          rust_current="$(sed -n 's|^FROM dhi.io/rust:\([^ ]*\).*|\1|p' Dockerfile | head -1)"
           rust_changed=false
           if [ "$rust_current" = "$rust_pinned" ]; then
             echo "Rust builder already pinned to ${rust_pinned}."
           else
             echo "Rust builder ${rust_current:-unpinned} -> ${rust_pinned}"
             printf '\n## Rust\n\n- builder `%s` -> `%s`\n' "${rust_current:-unpinned}" "$rust_pinned" >> "$report_file"
-            sed -i "s|^FROM rust:.*|FROM rust:${rust_pinned} AS builder|" Dockerfile
+            sed -i "s|^FROM dhi.io/rust:.*|FROM dhi.io/rust:${rust_pinned} AS builder|" Dockerfile
             rust_changed=true
           fi
           for workflow in .github/workflows/ci.yml .github/workflows/deploy.yml .github/workflows/dependency-updates.yml; do
@@ -129,25 +235,164 @@ jobs:
             rust_changed=true
           done
 
-          # Pin the runtime image to the current distroless nonroot digest. The tag stays nonroot (uid 65532).
-          token="$(curl -fsSL "https://gcr.io/v2/token?service=gcr.io&scope=repository:distroless/static-debian13:pull" | jq -r '.token')"
-          runtime_digest="$(curl -fsSL -D - -o /dev/null \
-            -H "Authorization: Bearer ${token}" \
-            -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
-            "https://gcr.io/v2/distroless/static-debian13/manifests/nonroot" \
-            | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:" { print $2; exit }')"
-          if ! [[ "$runtime_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::Unexpected distroless digest: ${runtime_digest:-empty}"
+          # Move the builder's apt pins to the candidate apt would install in
+          # that image. Both architectures must agree, and the candidate must
+          # install, before the Dockerfile changes.
+          echo "${DOCKERHUB_TOKEN}" | docker login dhi.io --username "${DOCKERHUB_USERNAME}" --password-stdin
+          python3 - << 'PY' > "$RUNNER_TEMP/apt-packages.txt"
+          import re
+          from pathlib import Path
+
+          found = []
+          grab = False
+          for line in Path("Dockerfile").read_text().splitlines():
+              if "apt-get install" in line:
+                  grab = True
+                  continue
+              if not grab:
+                  continue
+              stripped = line.strip()[:-1].strip() if line.strip().endswith("\\") else line.strip()
+              match = re.fullmatch(r"([a-z0-9][a-z0-9.+-]*)=(\S+)", stripped)
+              if match:
+                  found.append(f"{match.group(1)} {match.group(2)}")
+                  continue
+              break
+          if not found:
+              raise SystemExit("no apt pins found in Dockerfile")
+          print("\n".join(found))
+          PY
+          mapfile -t apt_packages < <(awk '{ print $1 }' "$RUNNER_TEMP/apt-packages.txt")
+          apt_candidates() {
+            local platform="$1"
+            shift
+            docker run --rm --user root --platform "$platform" --entrypoint sh \
+              "dhi.io/rust:${rust_pinned}" -c '
+                set -eu
+                apt-get update -qq
+                for pkg in "$@"; do
+                  ver="$(apt-cache policy "$pkg" | awk "/Candidate:/ { print \$2; exit }")"
+                  printf "%s %s\n" "$pkg" "$ver"
+                done
+              ' sh "$@"
+          }
+          apt_candidates linux/amd64 "${apt_packages[@]}" > "$RUNNER_TEMP/apt-amd64.txt"
+          apt_candidates linux/arm64 "${apt_packages[@]}" > "$RUNNER_TEMP/apt-arm64.txt"
+          if ! diff -q "$RUNNER_TEMP/apt-amd64.txt" "$RUNNER_TEMP/apt-arm64.txt" >/dev/null; then
+            echo "::error::apt candidates differ between linux/amd64 and linux/arm64"
+            diff -u "$RUNNER_TEMP/apt-amd64.txt" "$RUNNER_TEMP/apt-arm64.txt" || true
             exit 1
           fi
-          runtime_pinned="gcr.io/distroless/static-debian13:nonroot@${runtime_digest}"
-          runtime_current="$(sed -n 's/^FROM //p' Dockerfile | grep '^gcr.io/distroless/static-debian13:nonroot@' | head -1)"
+          if [ "$(wc -l < "$RUNNER_TEMP/apt-amd64.txt")" -ne "${#apt_packages[@]}" ]; then
+            echo "::error::apt candidate query returned an unexpected package list"
+            cat "$RUNNER_TEMP/apt-amd64.txt"
+            exit 1
+          fi
+          while read -r pkg ver; do
+            if ! [[ "$pkg" =~ ^[a-z0-9][a-z0-9.+-]*$ && "$ver" =~ ^[0-9][A-Za-z0-9.+~:-]*$ ]]; then
+              echo "::error::Unexpected apt candidate for ${pkg:-empty}: ${ver:-empty}"
+              exit 1
+            fi
+          done < "$RUNNER_TEMP/apt-amd64.txt"
+          if ! diff -q "$RUNNER_TEMP/apt-packages.txt" "$RUNNER_TEMP/apt-amd64.txt" >/dev/null; then
+            apt_install() {
+              local platform="$1"
+              shift
+              docker run --rm --user root --platform "$platform" --entrypoint sh \
+                "dhi.io/rust:${rust_pinned}" -c '
+                  set -eu
+                  apt-get update -qq
+                  apt-get install -y --no-install-recommends "$@"
+                ' sh "$@"
+            }
+            install_args=()
+            while read -r pkg ver; do
+              install_args+=("${pkg}=${ver}")
+            done < "$RUNNER_TEMP/apt-amd64.txt"
+            apt_install linux/amd64 "${install_args[@]}"
+            apt_install linux/arm64 "${install_args[@]}"
+            APT_CANDIDATES="$RUNNER_TEMP/apt-amd64.txt" python3 - << 'PY' | tee -a "$report_file"
+          import os
+          import re
+          from pathlib import Path
+
+          pins = {}
+          for line in Path(os.environ["APT_CANDIDATES"]).read_text().splitlines():
+              if not line.strip():
+                  continue
+              pkg, ver = line.split(" ", 1)
+              pins[pkg] = ver
+
+          path = Path("Dockerfile")
+          original = path.read_text().splitlines(keepends=True)
+          grab = False
+          seen = set()
+          changes = []
+          updated = []
+          for line in original:
+              if "apt-get install" in line:
+                  grab = True
+                  updated.append(line)
+                  continue
+              if grab:
+                  raw = line.strip()
+                  body = raw[:-1].strip() if raw.endswith("\\") else raw
+                  match = re.fullmatch(r"([a-z0-9][a-z0-9.+-]*)=(\S+)", body)
+                  if match:
+                      pkg, old = match.group(1), match.group(2)
+                      new = pins[pkg]
+                      seen.add(pkg)
+                      if old != new:
+                          changes.append((pkg, old, new))
+                          indent = line[: len(line) - len(line.lstrip(" "))]
+                          cont = " \\" if raw.endswith("\\") else ""
+                          newline = "\n" if line.endswith("\n") else ""
+                          line = f"{indent}{pkg}={new}{cont}{newline}"
+                      updated.append(line)
+                      continue
+                  grab = False
+              updated.append(line)
+
+          missing = sorted(set(pins) - seen)
+          if missing:
+              raise SystemExit("pins not rewritten: " + ", ".join(missing))
+          if not changes:
+              raise SystemExit("apt candidates differed but no Dockerfile pin changed")
+          path.write_text("".join(updated))
+          print("\n## Builder packages\n")
+          for pkg, old, new in changes:
+              print(f"- `{pkg}` `{old}` -> `{new}`")
+          PY
+          fi
+
+          # Pin the runtime to the newest plain Debian 13 static image (no glibc, no FIPS). nonroot is uid 65532.
+          static_token="$(dhi_token static)" || {
+            echo "::error::dhi.io token request failed for static"
+            exit 1
+          }
+          tags_json="$(curl -fsSL \
+            -H "Authorization: Bearer ${static_token}" \
+            "https://dhi.io/v2/static/tags/list?n=1000")" || {
+            echo "::error::Could not list dhi.io/static tags"
+            exit 1
+          }
+          runtime_tag="$(printf '%s\n' "$tags_json" | jq -r '.tags[]?' | grep -E '^[0-9]{8}-debian13$' | sort | tail -1 || true)"
+          if [ -z "$runtime_tag" ]; then
+            echo "::error::No dhi.io/static tag matching YYYYMMDD-debian13"
+            exit 1
+          fi
+          runtime_digest="$(dhi_index_digest static "$runtime_tag" "$static_token" || true)"
+          if ! [[ "$runtime_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Unexpected static image digest for ${runtime_tag}: ${runtime_digest:-empty}"
+            exit 1
+          fi
+          runtime_pinned="dhi.io/static:${runtime_tag}@${runtime_digest}"
+          runtime_current="$(sed -n 's/^FROM //p' Dockerfile | grep '^dhi.io/static:' | head -1)"
           if [ "$runtime_current" = "$runtime_pinned" ]; then
-            echo "Distroless runtime already pinned to ${runtime_pinned}."
+            echo "Hardened runtime already pinned to ${runtime_pinned}."
           else
-            echo "Distroless runtime ${runtime_current:-unpinned} -> ${runtime_pinned}"
+            echo "Hardened runtime ${runtime_current:-unpinned} -> ${runtime_pinned}"
             printf '\n## Runtime image\n\n- `%s` -> `%s`\n' "${runtime_current:-unpinned}" "$runtime_pinned" >> "$report_file"
-            sed -i "s|^FROM gcr.io/distroless/static-debian13:nonroot.*|FROM ${runtime_pinned}|" Dockerfile
+            sed -i "s|^FROM dhi.io/static:.*|FROM ${runtime_pinned}|" Dockerfile
           fi
 
           echo "rust_version=${rust_version}" >> "$GITHUB_OUTPUT"

@@ -1,14 +1,16 @@
 //! Contabo DNS and firewall sync binary.
 //!
-//! Loads config from the environment, starts logging, then runs DNS and firewall
-//! updates on a schedule. Hover any `///` documented name in the editor to see
-//! the same rustdoc text rust-analyzer shows (JSDoc-style).
+//! Loads config from the environment, starts logging, serves a loopback
+//! `GET /health` route, then runs DNS and firewall updates on a schedule.
+//! Hover any `///` documented name in the editor to see the same rustdoc text
+//! rust-analyzer shows (JSDoc-style).
 
 mod config;
 mod contabo;
 mod dns;
 mod error;
 mod firewall;
+mod health;
 mod ip;
 mod logsetup;
 mod retry;
@@ -22,13 +24,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-/// Process entry: parse env config, then start the sync loop.
+/// Process entry: `health` probes the loopback route, otherwise start the sync loop.
 ///
 /// Returns exit code 2 when required env is missing or invalid.
 fn main() -> ExitCode {
-    match config::Config::from_env() {
-        Ok(cfg) => start(cfg, retry::backoff),
-        Err(err) => config_error(&err),
+    dispatch(health::mode(std::env::args_os()))
+}
+
+/// Runs the healthcheck probe or the sync process.
+fn dispatch(mode: health::Mode) -> ExitCode {
+    match mode {
+        health::Mode::Probe => health::run_probe(),
+        health::Mode::Serve => match config::Config::from_env() {
+            Ok(cfg) => start(cfg, retry::backoff),
+            Err(err) => config_error(&err),
+        },
     }
 }
 
@@ -66,12 +76,22 @@ fn start(cfg: config::Config, delay: fn(u32) -> Duration) -> ExitCode {
     after_log_init(cfg, delay)
 }
 
-/// Builds the blocking HTTP client after logging is live.
+/// Serves the loopback healthcheck, then builds the blocking HTTP client.
 ///
-/// Returns exit code 1 when the client cannot be constructed.
+/// Returns exit code 1 when the listener or the client cannot be constructed.
 fn after_log_init(cfg: config::Config, delay: fn(u32) -> Duration) -> ExitCode {
+    let server = match health::serve_configured() {
+        Ok(server) => server,
+        Err(err) => {
+            log::error!("healthcheck: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    log::info!("healthcheck listening on {}", server.addr());
     let http = contabo::ReqwestHttp::new(cfg.tls_roots);
-    after_client(cfg, http, delay)
+    let code = after_client(cfg, http, delay);
+    drop(server);
+    code
 }
 
 /// Continues with a built client, or exits 1 when construction failed.
@@ -199,8 +219,8 @@ fn cycle_failed(
 #[cfg(test)]
 mod tests {
     use super::{
-        after_client, after_http_client_error, after_log_init, config_error, cycle_failed, execute,
-        run_after_http, start,
+        after_client, after_http_client_error, after_log_init, config_error, cycle_failed,
+        dispatch, execute, run_after_http, start,
     };
     use crate::contabo::{ContaboClient, ReqwestHttp};
     use crate::error::Error;
@@ -357,6 +377,17 @@ mod tests {
             ExitCode::SUCCESS
         );
         assert_eq!(cycles, 1);
+    }
+
+    /// Probe mode does not require Contabo credentials. A bad bind exits 1.
+    #[test]
+    fn dispatch_probes_and_rejects_a_public_bind() {
+        assert_eq!(dispatch(crate::health::Mode::Probe), ExitCode::from(1));
+        let _guard = crate::health::override_bind(Some("0.0.0.0:8080".into()));
+        assert_eq!(
+            after_log_init(sample("0", "true"), crate::retry::immediate),
+            ExitCode::from(1)
+        );
     }
 
     /// `main` exits 2 when thread-local test env has no credentials.
