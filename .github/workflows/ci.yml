@@ -26,6 +26,12 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
+    environment: ${{ github.base_ref || github.ref_name }}
     steps:
       - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
+        with:
+          registry: dhi.io
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - run: docker build -t contabo-ddns .

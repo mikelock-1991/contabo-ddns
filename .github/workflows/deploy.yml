@@ -20,9 +20,11 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       sha: ${{ steps.meta.outputs.sha }}
       repo_lc: ${{ steps.meta.outputs.repo_lc }}
+      digest: ${{ steps.build.outputs.digest }}
       dependency_update: ${{ steps.change_source.outputs.dependency_update }}
     permissions:
       actions: write
+      id-token: write
       packages: write
     steps:
       - name: Create pipeline app token
@@ -165,7 +167,15 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Log in to Docker Hardened Images
+        uses: docker/login-action@v4
+        with:
+          registry: dhi.io
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -183,6 +193,17 @@ jobs:
             org.opencontainers.image.version=${{ steps.meta.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign images
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+        run: |
+          cosign sign --yes "ghcr.io/${{ steps.meta.outputs.repo_lc }}@${DIGEST}"
+          cosign sign --yes "docker.io/${DOCKERHUB_USERNAME}/contabo-ddns@${DIGEST}"
 
   smoke:
     needs: build-and-push
@@ -226,6 +247,25 @@ jobs:
           VERSION: ${{ needs.build-and-push.outputs.version }}
           DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
         run: docker pull "docker.io/${DOCKERHUB_USERNAME}/contabo-ddns:${VERSION}"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Verify signatures
+        env:
+          DIGEST: ${{ needs.build-and-push.outputs.digest }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+        run: |
+          repo_lc="$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          identity="^https://github.com/${GITHUB_REPOSITORY}/\\.github/workflows/deploy\\.yml@"
+          cosign verify \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp "$identity" \
+            "ghcr.io/${repo_lc}@${DIGEST}"
+          cosign verify \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp "$identity" \
+            "docker.io/${DOCKERHUB_USERNAME}/contabo-ddns@${DIGEST}"
 
       - name: Post-deploy webhook
         env:
@@ -301,12 +341,14 @@ jobs:
           generated_body="$(jq -r '.body // empty' <<<"$generated" | grep -v 'chore: bump patch version to ' || true)"
 
           {
-            echo "Images for \`${VERSION}\` from \`${branch}\`."
+            echo "Image for \`${VERSION}\` from \`${branch}\`."
             echo
             echo "| Registry | Channel | Version |"
             echo "| --- | --- | --- |"
             echo "| GHCR | \`ghcr.io/${REPO_LC}:${channel}\` | \`ghcr.io/${REPO_LC}:${VERSION}\` |"
             echo "| Docker Hub | \`docker.io/${DOCKERHUB_USERNAME}/contabo-ddns:${channel}\` | \`docker.io/${DOCKERHUB_USERNAME}/contabo-ddns:${VERSION}\` |"
+            echo
+            echo "Both copies are signed by the deploy workflow through Sigstore. Verify with \`cosign verify\`."
             echo
             printf '%s\n' "$generated_body"
           } > release-notes.md
