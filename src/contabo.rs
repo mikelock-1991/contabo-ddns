@@ -1,6 +1,7 @@
 //! Blocking HTTP trait, reqwest client, and authenticated Contabo JSON API.
 
 use std::fmt::Write as _;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -45,15 +46,33 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+/// Address family for an echo lookup. `V4` is curl `-4`; `V6` is curl `-6`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpFamily {
+    V4,
+    V6,
+}
+
 /// Thread-safe HTTP sender. DNS and firewall sync call this from parallel threads.
 pub trait Http: Send + Sync {
     /// Performs one request and returns status plus body bytes.
     fn send(&self, request: &HttpRequest) -> Result<HttpResponse, Error>;
+
+    /// Same as `send`, restricted to one IP family. The default ignores the family.
+    fn send_family(&self, request: &HttpRequest, family: IpFamily) -> Result<HttpResponse, Error> {
+        let _ = family;
+        self.send(request)
+    }
 }
 
 /// Production HTTP client: reqwest blocking + rustls, 30s default timeout.
+///
+/// API calls use `client`. Echo lookups use `v4` or `v6`, which bind the local
+/// socket to one family so DNS answers of the other family are not dialed.
 pub struct ReqwestHttp {
     client: Client,
+    v4: Client,
+    v6: Option<Client>,
 }
 
 /// Wraps an invalid HTTP method string.
@@ -86,51 +105,94 @@ fn read_response_body(response: reqwest::blocking::Response, max: usize) -> Resu
 }
 
 impl ReqwestHttp {
-    /// Builds the shared blocking client (user-agent, 30s timeout, 5 redirects).
+    /// Builds the API client and the IPv4 echo client. The IPv6 echo client exists only when `ipv6` is set.
     ///
     /// `roots` selects the embedded Mozilla store, the OS bundle, or both.
-    pub fn new(roots: crate::config::TlsRoots) -> Result<Self, Error> {
-        use crate::config::TlsRoots;
-        let builder = Client::builder()
-            .user_agent("contabo-ddns")
-            .timeout(HTTP_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
-            .tls_built_in_webpki_certs(matches!(roots, TlsRoots::Both | TlsRoots::Webpki))
-            .tls_built_in_native_certs(matches!(roots, TlsRoots::Both | TlsRoots::Native));
-        finish_build(builder.build())
+    pub fn new(roots: crate::config::TlsRoots, ipv6: bool) -> Result<Self, Error> {
+        let v6 = if ipv6 {
+            build_client(roots, Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED))).map(Some)
+        } else {
+            Ok(None)
+        };
+        assemble(
+            build_client(roots, None),
+            build_client(roots, Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED))),
+            v6,
+        )
     }
 }
 
-fn finish_build(result: Result<Client, reqwest::Error>) -> Result<ReqwestHttp, Error> {
-    let client = result.map_err(|err| Error::wrap("build http client", err))?;
-    Ok(ReqwestHttp { client })
+fn assemble(
+    client: Result<Client, Error>,
+    v4: Result<Client, Error>,
+    v6: Result<Option<Client>, Error>,
+) -> Result<ReqwestHttp, Error> {
+    Ok(ReqwestHttp {
+        client: client?,
+        v4: v4?,
+        v6: v6?,
+    })
+}
+
+fn build_client(roots: crate::config::TlsRoots, local: Option<IpAddr>) -> Result<Client, Error> {
+    use crate::config::TlsRoots;
+    let mut builder = Client::builder()
+        .user_agent("contabo-ddns")
+        .timeout(HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+        .tls_built_in_webpki_certs(matches!(roots, TlsRoots::Both | TlsRoots::Webpki))
+        .tls_built_in_native_certs(matches!(roots, TlsRoots::Both | TlsRoots::Native));
+    if let Some(addr) = local {
+        builder = builder.local_address(addr);
+    }
+    finish_build(builder.build())
+}
+
+fn finish_build(result: Result<Client, reqwest::Error>) -> Result<Client, Error> {
+    result.map_err(|err| Error::wrap("build http client", err))
+}
+
+fn send_with(client: &Client, request: &HttpRequest) -> Result<HttpResponse, Error> {
+    let method = match reqwest::Method::from_bytes(request.method.as_bytes()) {
+        Ok(method) => method,
+        Err(err) => return Err(http_method_err(err)),
+    };
+    let mut builder = client.request(method, &request.url);
+    if let Some(timeout) = request.timeout {
+        builder = builder.timeout(timeout);
+    }
+    for (name, value) in &request.headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    if let Some(body) = &request.body {
+        builder = builder.body(body.clone());
+    }
+    let response = match builder.send() {
+        Ok(response) => response,
+        Err(err) => return Err(http_request_err(&request.url, err)),
+    };
+    let status = response.status().as_u16();
+    let max = request.max_body.unwrap_or(MAX_API_BODY);
+    let body = read_response_body(response, max)?;
+    Ok(HttpResponse { status, body })
 }
 
 impl Http for ReqwestHttp {
-    /// Sends `request` with optional per-call timeout override.
+    /// Sends `request` on the unrestricted API client.
     fn send(&self, request: &HttpRequest) -> Result<HttpResponse, Error> {
-        let method = match reqwest::Method::from_bytes(request.method.as_bytes()) {
-            Ok(method) => method,
-            Err(err) => return Err(http_method_err(err)),
+        send_with(&self.client, request)
+    }
+
+    /// Sends an echo request on the IPv4-only or IPv6-only client.
+    fn send_family(&self, request: &HttpRequest, family: IpFamily) -> Result<HttpResponse, Error> {
+        let client = match family {
+            IpFamily::V4 => &self.v4,
+            IpFamily::V6 => self
+                .v6
+                .as_ref()
+                .ok_or_else(|| Error::new("IPV6 is disabled"))?,
         };
-        let mut builder = self.client.request(method, &request.url);
-        if let Some(timeout) = request.timeout {
-            builder = builder.timeout(timeout);
-        }
-        for (name, value) in &request.headers {
-            builder = builder.header(name.as_str(), value.as_str());
-        }
-        if let Some(body) = &request.body {
-            builder = builder.body(body.clone());
-        }
-        let response = match builder.send() {
-            Ok(response) => response,
-            Err(err) => return Err(http_request_err(&request.url, err)),
-        };
-        let status = response.status().as_u16();
-        let max = request.max_body.unwrap_or(MAX_API_BODY);
-        let body = read_response_body(response, max)?;
-        Ok(HttpResponse { status, body })
+        send_with(client, request)
     }
 }
 
@@ -675,7 +737,7 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
             stream.write_all(body).unwrap();
         });
-        let http = ReqwestHttp::new(crate::config::TlsRoots::Both).unwrap();
+        let http = ReqwestHttp::new(crate::config::TlsRoots::Both, false).unwrap();
         let response = http
             .send(&HttpRequest {
                 method: "POST".into(),
@@ -834,9 +896,57 @@ mod tests {
     #[test]
     fn tls_root_modes_build_a_client() {
         use crate::config::TlsRoots;
-        assert!(ReqwestHttp::new(TlsRoots::Both).is_ok());
-        assert!(ReqwestHttp::new(TlsRoots::Webpki).is_ok());
-        assert!(ReqwestHttp::new(TlsRoots::Native).is_ok());
+        assert!(ReqwestHttp::new(TlsRoots::Both, false).is_ok());
+        assert!(ReqwestHttp::new(TlsRoots::Webpki, false).is_ok());
+        assert!(ReqwestHttp::new(TlsRoots::Native, true).is_ok());
+    }
+
+    #[test]
+    fn echo_clients_are_bound_to_one_family() {
+        let request = |url: &str| HttpRequest {
+            method: "GET".into(),
+            url: url.into(),
+            headers: vec![],
+            body: None,
+            timeout: Some(Duration::from_millis(200)),
+            max_body: Some(64),
+        };
+        let v4 = ReqwestHttp::new(crate::config::TlsRoots::Both, false).unwrap();
+        assert!(
+            v4.send_family(&request("http://127.0.0.1:1/"), IpFamily::V4)
+                .is_err()
+        );
+        assert!(
+            v4.send_family(&request("http://[::1]:1/"), IpFamily::V6)
+                .unwrap_err()
+                .to_string()
+                .contains("IPV6 is disabled")
+        );
+        let both = ReqwestHttp::new(crate::config::TlsRoots::Both, true).unwrap();
+        assert!(
+            both.send_family(&request("http://[::1]:1/"), IpFamily::V6)
+                .is_err()
+        );
+
+        let client = build_client(crate::config::TlsRoots::Both, None).unwrap();
+        let err = Error::new("build http client");
+        assert!(assemble(Err(err), Ok(client.clone()), Ok(None)).is_err());
+        assert!(
+            assemble(
+                Ok(client.clone()),
+                Err(Error::new("build http client")),
+                Ok(None),
+            )
+            .is_err()
+        );
+        assert!(
+            assemble(
+                Ok(client.clone()),
+                Ok(client),
+                Err(Error::new("build http client")),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -844,7 +954,7 @@ mod tests {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
-        let http = ReqwestHttp::new(crate::config::TlsRoots::Both).unwrap();
+        let http = ReqwestHttp::new(crate::config::TlsRoots::Both, false).unwrap();
         let sink = crate::test_http::closing_endpoint();
         let dropped = http
             .send(&HttpRequest {

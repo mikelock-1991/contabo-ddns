@@ -1,6 +1,6 @@
 # contabo-ddns
 
-Rust program that updates Contabo DNS A records and the IPv4 sources of named firewall rules. The published container is a static binary on a [Docker Hardened Image](https://docs.docker.com/dhi/). Run it on the network whose public address should be published. On the Contabo VPS, the echo service returns the VPS address. At home, it returns the home address.
+Rust program that updates Contabo DNS A and AAAA records and the IPv4 and IPv6 sources of named firewall rules. The published container is a static binary on a [Docker Hardened Image](https://docs.docker.com/dhi/). Run it on the network whose public address should be published. On the Contabo VPS, the echo service returns the VPS address. At home, it returns the home address. IPv6 stays off until `IPV6=true`.
 
 ## Run the published image
 
@@ -31,6 +31,12 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/contabo-ddns", "health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
 
 volumes:
   contabo-ddns-logs:
@@ -42,7 +48,7 @@ docker compose up -d
 
 Podman uses the same file: `podman compose up -d`. Log in to `ghcr.io` first when that package is private, then set `image` to `ghcr.io/mikelock-1991/contabo-ddns:latest`.
 
-The image healthcheck runs `contabo-ddns health` every 30 seconds. Inside the container that is `GET /health` on `127.0.0.1:8080`, and the body `ok` means healthy. Do not publish the port. `HEALTHCHECK_BIND` can select another loopback address. Any other address is rejected. After the 15 second start period, `docker compose ps` shows `healthy`.
+That Compose healthcheck runs `contabo-ddns health` every 30 seconds. Inside the container that is `GET /health` on `127.0.0.1:8080`, and the body `ok` means healthy. Do not publish the port. `HEALTHCHECK_BIND` can select another loopback address. Any other address is rejected. After the 15 second start period, `docker compose ps` shows `healthy`.
 
 Follow the log with `docker compose logs -f`.
 
@@ -56,7 +62,7 @@ Fill in the four Contabo credentials from the customer panel (API section): clie
 
 At least one of DNS or the firewall must be enabled. Booleans accept `true`/`false`, `yes`/`no`, `on`/`off`, or `1`/`0`. Case does not matter.
 
-`CONTABO_API_BASE`, `CONTABO_AUTH_URL`, and every `IP_ECHO_URL` must start with `https://`.
+`CONTABO_API_BASE`, `CONTABO_AUTH_URL`, and every echo URL must start with `https://`.
 
 | Variable                  | Default                           | Purpose                                                                                                                      |
 | ------------------------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
@@ -69,12 +75,13 @@ At least one of DNS or the firewall must be enabled. Booleans accept `true`/`fal
 | `RUN_ON_START`            | `true`                            | `false` waits `INTERVAL_SECONDS` before the first sync.                                                                      |
 | `INTERVAL_SECONDS`        | `300`                             | Seconds between cycles. `0` runs once and exits. Any other value must be at least 30. `false` combined with `0` is rejected. |
 | `DRY_RUN`                 | `false`                           | Log the DNS and firewall writes and skip POST, PATCH, and PUT.                                                               |
-| `IP_ECHO_URL`             | `https://ipecho.net/plain`        | Comma-separated echo URLs, tried in order.                                                                                   |
+| `IP_ECHO_URL`             | `https://ipecho.net/plain`        | Comma-separated echo URLs, tried in order. IPv4 is requested like `curl -4`.                                                 |
+| `IPV6`                    | `false`                           | `true` also requests those URLs over IPv6 only, like `curl -6`.                                                              |
 | `IP_ECHO_TIMEOUT_SECONDS` | `10`                              | Seconds for each echo request. At least 1.                                                                                   |
 | `DNS_ENABLED`             | on when `DNS_RECORDS` is set      | `false` turns DNS off even when records are set.                                                                             |
 | `DNS_RECORDS`             | required while DNS is on          | Comma-separated hostnames.                                                                                                   |
 | `DNS_TTL`                 | API default                       | When set, at least 1.                                                                                                        |
-| `DNS_CREATE_MISSING`      | `false`                           | Create a missing A record for an exact name only.                                                                            |
+| `DNS_CREATE_MISSING`      | `false`                           | Create a missing A or AAAA record for an exact name only.                                                                    |
 | `FIREWALL_ENABLED`        | on when `FIREWALL_RULES` is set   | `false` turns the firewall off even when rules are set.                                                                      |
 | `FIREWALL_ID`             | one of id or name                 | Firewall id.                                                                                                                 |
 | `FIREWALL_NAME`           | one of id or name                 | Exact firewall name.                                                                                                         |
@@ -88,13 +95,13 @@ At least one of DNS or the firewall must be enabled. Booleans accept `true`/`fal
 | `LOG_TO_STDOUT`           | `true`                            | `false` requires a non-empty `LOG_DIR`.                                                                                      |
 | `HEALTHCHECK_BIND`        | `127.0.0.1:8080`                  | Loopback address for `GET /health`. A non-loopback address is rejected. Do not publish the port.                             |
 
-`home.example.com` updates that A record. `example.com` is the zone apex and is written as `@`. `*.example.com` updates existing A records in that zone and its children. Wildcards do not create records. Other record types are left alone.
+`home.example.com` updates that A record when a public IPv4 address is known, and that AAAA record when a public IPv6 address is known. `example.com` is the zone apex and is written as `@`. `*.example.com` updates existing A and AAAA records in that zone and its children. Wildcards do not create records. Other record types are left alone. With `IPV6` left false, AAAA records stay as they are.
 
-A firewall source is an IPv4 address, an IPv4 CIDR, a hostname, or `current`. A hostname contributes one `/32` per A record. `current` is the address returned by `IP_ECHO_URL`. Set exactly one of `FIREWALL_ID` or `FIREWALL_NAME`. Duplicate sources are dropped and the remaining order is kept.
+A firewall source is an IPv4 or IPv6 address, a CIDR, a hostname, `current`, or `current6`. A hostname contributes one `/32` per A record and one `/128` per AAAA record. `current` is the IPv4 answer from `IP_ECHO_URL`. `current6` is the IPv6 answer and requires `IPV6=true`. IPv4 sources replace `srcCidr.ipv4` only, and IPv6 sources replace `srcCidr.ipv6` only. The other family is left as it is. Set exactly one of `FIREWALL_ID` or `FIREWALL_NAME`. Duplicate sources are dropped and the remaining order is kept.
 
 `TLS_ROOTS=both` uses the embedded Mozilla roots and the image CA bundle. `webpki` uses only the embedded roots. `native` uses only the bundle.
 
-Echo answers that are private, loopback, link-local, carrier-grade NAT (`100.64.0.0/10`), or benchmarking (`198.18.0.0/15`) are skipped.
+IPv4 echo answers that are private, loopback, link-local, carrier-grade NAT (`100.64.0.0/10`), or benchmarking (`198.18.0.0/15`) are skipped. IPv6 answers that are loopback, link-local, unique-local, documentation (`2001:db8::/32`), benchmarking (`2001:2::/48`), discard-only (`100::/64`), or IPv4-mapped are skipped.
 
 ## Image
 
@@ -188,13 +195,13 @@ Exit code 2 means the environment or the log directory was rejected. Exit code 1
 
 ## What a cycle does
 
-Each cycle fetches the public IP when DNS is on or a firewall rule uses `current`, then updates DNS and the firewall in parallel.
+Each cycle fetches the public IPv4 address, over IPv4 only, when DNS is on or a firewall rule uses `current`. With `IPV6=true` it fetches the same echo URLs over IPv6 only when DNS is on or a rule uses `current6`. DNS and the firewall then update in parallel.
 
 Transient HTTP failures are retried up to three extra times, waiting 1 second, then 2, then 4. GET, PATCH, PUT, and the token request retry on timeouts, connection errors, 429, and 5xx. A DNS record POST retries only on 429, because a 5xx or a timeout may follow a create that already happened.
 
-If the public IP lookup fails, DNS is skipped and the cycle reports an error. The firewall still syncs unless one of its rules uses `current`.
+If the IPv4 lookup fails, A records are left unchanged and the cycle reports an error. AAAA records still update when the IPv6 lookup succeeded. The firewall still syncs unless one of its rules uses `current` and the IPv4 address is unknown, or `current6` and the IPv6 address is unknown.
 
-The matching firewall rule's IPv4 sources are replaced. IPv6 sources, other rules, and unknown fields are copied through. If a rule name is missing, a hostname does not resolve, or the new source list would be empty, the firewall is not updated. A name lookup is cached until a GET for that id returns 404. A firewall PUT replaces the whole inbound rule list from the last GET, so a console edit made during that window can be overwritten.
+The matching firewall rule's configured address family is replaced. A rule with only IPv4 sources leaves `srcCidr.ipv6` unchanged, and a rule with only IPv6 sources leaves `srcCidr.ipv4` unchanged. Other rules and unknown fields are copied through. If a rule name is missing, a hostname does not resolve, or the new source list would be empty, the firewall is not updated. A name lookup is cached until a GET for that id returns 404. A firewall PUT replaces the whole inbound rule list from the last GET, so a console edit made during that window can be overwritten.
 
 ## Tests
 
