@@ -2,10 +2,15 @@
 # Docker Hardened Image (debian13 dev) and its manifest-list digest.
 # That image ships rustc and cargo, not rustup. The musl standard library
 # comes from the matching standalone component. Rust 1.99 links musl itself.
+# ring still compiles C, and cc looks up x86_64-linux-musl-gcc for this target.
 FROM dhi.io/rust:1.99.1-debian13-dev@sha256:caad43bd38067fba8be69a1540c3350d1ff3269e731065801b4b91bb17313301 AS builder
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl xz-utils \
+    && apt-get install -y --no-install-recommends curl xz-utils musl-tools \
     && rm -rf /var/lib/apt/lists/* \
+    && test -x /usr/bin/musl-gcc \
+    && test -x /usr/bin/ar \
+    && ln -sf /usr/bin/musl-gcc /usr/local/bin/x86_64-linux-musl-gcc \
+    && ln -sf /usr/bin/ar /usr/local/bin/x86_64-linux-musl-ar \
     && rust_version="$(rustc --version | awk '{print $2}')" \
     && case "$rust_version" in \
          [0-9]*.[0-9]*.[0-9]*) ;; \
