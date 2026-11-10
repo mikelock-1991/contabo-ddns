@@ -13,6 +13,7 @@ mod firewall;
 mod health;
 mod ip;
 mod logsetup;
+mod resolve;
 mod retry;
 mod sync;
 
@@ -112,7 +113,7 @@ fn after_http_client_error(err: &error::Error) -> ExitCode {
     ExitCode::from(1)
 }
 
-/// Runs the sync schedule with the OS DNS resolver and an interruptible sleep.
+/// Runs the sync schedule with the shared DNS resolver and an interruptible sleep.
 fn run_after_http(
     cfg: config::Config,
     http: &dyn contabo::Http,
