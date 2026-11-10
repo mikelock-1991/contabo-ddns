@@ -43,4 +43,8 @@ jobs:
           registry: dhi.io
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - run: docker buildx build --platform ${{ matrix.platform }} --output type=cacheonly .
+      - name: Build and load the runtime image
+        run: docker buildx build --platform ${{ matrix.platform }} --load --tag contabo-ddns:ci .
+      - name: Test DNS on user-defined bridge and macvlan networks
+        timeout-minutes: 5
+        run: bash tests/docker/network-smoke.sh contabo-ddns:ci

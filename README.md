@@ -242,6 +242,17 @@ cargo check-fmt
 cargo lint
 ```
 
+The Docker CI job loads the production image and runs it on user-defined bridge and macvlan networks on both amd64 and arm64. Each network is tested with UDP DNS and with truncated UDP replies that require TCP fallback. Local DNS and HTTPS fixtures verify Docker service aliases, upstream A/AAAA resolution, `/etc/hosts`, and the resulting DNS and firewall updates. The test checks that the container uses `127.0.0.11`; it uses dummy credentials and never contacts Contabo.
+
+To run the same smoke test on a rootful Linux Docker host, build the image and run:
+
+```sh
+docker buildx build --load --tag contabo-ddns:ci .
+bash tests/docker/network-smoke.sh contabo-ddns:ci
+```
+
+The macvlan test creates and removes a dummy parent interface using `sudo ip`, so it does not need access to the host's physical network. It tests Docker's local macvlan DNS path; a particular LAN's routing or firewall configuration still needs testing on that LAN. The unusual Docker UDP reply-port case is covered separately by the Rust resolver tests.
+
 `cargo coverage` needs the `llvm-tools-preview` component and `cargo-llvm-cov`:
 
 ```sh
