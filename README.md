@@ -48,9 +48,39 @@ docker compose up -d
 
 Podman uses the same file: `podman compose up -d`. Log in to `ghcr.io` first when that package is private, then set `image` to `ghcr.io/mikelock-1991/contabo-ddns:latest`.
 
+DNS lookups use Hickory inside the binary, bypassing musl's resolver. The program follows the system DNS configuration and `/etc/hosts`, including Docker's `127.0.0.11` on user-defined networks such as macvlan. It uses UDP with TCP fallback. For queries to `127.0.0.11:53` only, replies from another port on that same IP are accepted; query IDs, questions, and DNS records are still checked. Other DNS servers retain strict source address and port checks. No Compose DNS override or mounted `resolv.conf` is needed.
+
 That Compose healthcheck runs `contabo-ddns health` every 30 seconds. Inside the container that is `GET /health` on `127.0.0.1:8080`, and the body `ok` means healthy. Do not publish the port. `HEALTHCHECK_BIND` can select another loopback address. Any other address is rejected. After the 15 second start period, `docker compose ps` shows `healthy`.
 
 Follow the log with `docker compose logs -f`.
+
+A named volume such as `contabo-ddns-logs` is created from the image directory, which is already owned by uid 65532. A host directory is not. Create it and give that user write access before using it as the log mount:
+
+```sh
+sudo install -d -o 65532 -g 65532 -m 750 /var/log/contabo-ddns
+```
+
+Rootless Podman maps container uids onto the host, so the same numbers have to be applied inside that mapping:
+
+```sh
+mkdir -p /var/log/contabo-ddns
+podman unshare chown 65532:65532 /var/log/contabo-ddns
+podman unshare chmod 750 /var/log/contabo-ddns
+```
+
+To leave the directory owned by root, add an ACL instead. `setfacl` comes from the `acl` package.
+
+```sh
+sudo install -d -m 755 /var/log/contabo-ddns
+sudo setfacl -m u:65532:rwx /var/log/contabo-ddns
+```
+
+Rootless Podman again applies the container uid, not the host uid:
+
+```sh
+mkdir -p /var/log/contabo-ddns
+podman unshare setfacl -m u:65532:rwx /var/log/contabo-ddns
+```
 
 ## Configure
 
@@ -107,7 +137,7 @@ IPv4 echo answers that are private, loopback, link-local, carrier-grade NAT (`10
 
 The runtime image is a [Docker Hardened Image](https://docs.docker.com/dhi/), `dhi.io/static`, Debian 13. That base is not a Linux distribution you can log into. It has a CA certificate bundle, a `nonroot` user, and nothing else: no shell, no package manager, and no extra libraries.
 
-The program is Rust, copied in as one statically linked musl binary. Published tags are multi-architecture manifests for `linux/amd64` and `linux/arm64`, so Apple Silicon and other arm64 hosts pull the arm64 image. A local `docker build` uses the machine's own architecture. The image also contains `/var/log/contabo-ddns`, owned by uid **65532** (gid 65532). That is the only path the process can write. A host bind mount for logs must be writable by uid 65532.
+The program is Rust, copied in as one statically linked musl binary. Published tags are multi-architecture manifests for `linux/amd64` and `linux/arm64`, so Apple Silicon and other arm64 hosts pull the arm64 image. A local `docker build` uses the machine's own architecture. The image also contains `/var/log/contabo-ddns`, owned by uid **65532** (gid 65532). That is the only path the process can write. A host bind mount has to be prepared with the `chown` or `setfacl` commands in [Run the published image](#run-the-published-image).
 
 The healthcheck runs `/usr/local/bin/contabo-ddns health`. The image has no shell and no curl, so Docker calls the binary. It requests `GET /health` on `HEALTHCHECK_BIND` and expects the body `ok`.
 
@@ -175,7 +205,7 @@ podman run --rm --env-file .env -e INTERVAL_SECONDS=0 -e LOG_DIR= \
   contabo-ddns
 ```
 
-A host bind mount must be writable by uid 65532:
+A host bind mount uses the directory prepared above. On Podman with SELinux, add `:Z` so the directory can be relabeled:
 
 ```sh
 podman run --rm --env-file .env -e INTERVAL_SECONDS=0 \

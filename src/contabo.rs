@@ -151,7 +151,16 @@ fn build_client(roots: crate::config::TlsRoots, local: Option<IpAddr>) -> Result
     if let Some(addr) = local {
         builder = builder.local_address(addr);
     }
-    finish_build(builder.build())
+    // Share the native Rust DNS resolver with firewall hostname lookups.
+    finish_with_resolver(builder, crate::resolve::HostResolver::system())
+}
+
+fn finish_with_resolver(
+    builder: reqwest::blocking::ClientBuilder,
+    resolver: Result<crate::resolve::HostResolver, Error>,
+) -> Result<Client, Error> {
+    let resolver = resolver?;
+    finish_build(builder.dns_resolver(std::sync::Arc::new(resolver)).build())
 }
 
 /// Embedded Mozilla roots. `from_der` only stores the bytes when rustls is the TLS backend.
@@ -965,6 +974,10 @@ mod tests {
 
     #[test]
     fn http_error_helpers() {
+        let err = finish_with_resolver(Client::builder(), Err(Error::new("DNS setup failed")))
+            .err()
+            .unwrap();
+        assert_eq!(err.to_string(), "DNS setup failed");
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
