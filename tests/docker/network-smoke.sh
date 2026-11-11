@@ -74,7 +74,7 @@ docker pull "$fixture_image"
 
 for driver in bridge macvlan; do
   for dns_mode in udp tcp-fallback; do
-    for config_mode in system unreadable; do
+    for config_mode in system blank explicit unreadable invalid; do
       echo "Testing $driver network with $dns_mode DNS and $config_mode configuration"
       options=(--driver "$driver" --subnet 192.0.2.0/24 --gateway 192.0.2.1)
       if [[ $driver == macvlan ]]; then
@@ -89,23 +89,29 @@ for driver in bridge macvlan; do
       docker run --detach --name "$fixture" --init --read-only \
         --cap-drop ALL --cap-add NET_BIND_SERVICE \
         --network "$network" --ip 192.0.2.2 \
-        --network-alias api.ddns.test --network-alias auth.ddns.test \
         --mount "type=bind,src=$fixture_dir,dst=/fixture,readonly" \
         --mount "type=bind,src=$scratch,dst=/tls,readonly" \
         --env PYTHONDONTWRITEBYTECODE=1 --env "DNS_MODE=$dns_mode" \
         "$fixture_image" python -u /fixture/fixture.py serve
       timeout 30s docker exec "$fixture" python /fixture/fixture.py wait
 
-      # CI's upstream DNS points at the fixture. Docker configures its usual
-      # 127.0.0.11 stub; the unreadable case masks only its configuration file.
-      configuration_options=()
-      if [[ $config_mode == unreadable ]]; then
-        # Reproduce a resolver file that the image's uid 65532 cannot read.
-        # This CI-only mount does not change Docker's nameserver or forwarding.
-        printf 'nameserver 127.0.0.11\n' >"$scratch/unreadable-resolv.conf"
-        chmod 600 "$scratch/unreadable-resolv.conf"
-        configuration_options+=(--mount "type=bind,src=$scratch/unreadable-resolv.conf,dst=/etc/resolv.conf,readonly")
-      fi
+      # Unset and blank settings use system DNS; explicit settings must bypass it.
+      printf 'nameserver 192.0.2.2\n' >"$scratch/resolv.conf"
+      chmod 644 "$scratch/resolv.conf"
+      configuration_options=(--mount "type=bind,src=$scratch/resolv.conf,dst=/etc/resolv.conf,readonly")
+      case "$config_mode" in
+        system) ;;
+        blank) configuration_options+=(--env 'DNS_SERVERS=   ') ;;
+        unreadable)
+          chmod 600 "$scratch/resolv.conf"
+          configuration_options+=(--env DNS_SERVERS=192.0.2.2)
+          ;;
+        explicit)
+          printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1\n' >"$scratch/resolv.conf"
+          configuration_options+=(--env DNS_SERVERS=192.0.2.2)
+          ;;
+        invalid) configuration_options+=(--env DNS_SERVERS=invalid) ;;
+      esac
       docker create --name "$app" --init --read-only --cap-drop ALL "${configuration_options[@]}" \
         --security-opt no-new-privileges:true --network "$network" --dns 192.0.2.2 \
         --add-host hosts.ddns.test:203.0.113.30 \
@@ -125,17 +131,26 @@ for driver in bridge macvlan; do
       docker start "$app"
       status=$(timeout 90s docker wait "$app")
       docker logs "$app"
-      [[ $status == 0 ]]
-      if [[ $config_mode == unreadable ]]; then
+      if [[ $config_mode == invalid ]]; then
+        [[ $status == 1 ]]
         docker logs "$app" 2>&1 | awk '
-          /cannot read \/etc\/resolv.conf; using Docker DNS/ { found=1 }
+          /DNS_SERVERS must contain comma-separated IP addresses/ { found=1 }
+          END { exit !found }
+        '
+        cleanup_case
+        continue
+      fi
+      [[ $status == 0 ]]
+      if [[ $config_mode == unreadable || $config_mode == explicit ]]; then
+        docker logs "$app" 2>&1 | awk '
+          /INFO.*using configured DNS_SERVERS=192.0.2.2; system DNS disabled/ { found=1 }
           END { exit !found }
         '
       fi
-      docker cp "$app:/etc/resolv.conf" "$scratch/resolv.conf"
-      cat "$scratch/resolv.conf"
-      awk '$1 == "nameserver" && $2 == "127.0.0.11" { found=1 } END { exit !found }' \
-        "$scratch/resolv.conf"
+      if docker logs "$app" 2>&1 | awk '/system DNS.*failed|using fallback/ { found=1 } END { exit !found }'; then
+        echo 'DNS selection unexpectedly tried system DNS or public fallback' >&2
+        exit 1
+      fi
       docker exec "$fixture" python /fixture/fixture.py assert
       cleanup_case
     done
