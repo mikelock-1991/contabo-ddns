@@ -1,6 +1,6 @@
 //! Public-IP fetch and firewall source resolution (CIDR, hostname, `current`).
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
@@ -30,7 +30,7 @@ pub trait Resolver: Send + Sync {
     fn lookup_v6(&self, host: &str) -> Result<Vec<Ipv6Addr>, Error>;
 }
 
-/// Resolver that uses the OS `getaddrinfo` / `ToSocketAddrs` path.
+/// Uses the shared Hickory resolver, including the system DNS and hosts file.
 pub struct SystemResolver;
 
 /// Keeps unique IPv4 addresses from a socket-addr iterator; errors if none remain.
@@ -74,24 +74,21 @@ pub(crate) fn ipv6_from_addresses(
 }
 
 impl Resolver for SystemResolver {
-    /// Resolves `host` through the operating system and filters to IPv4.
+    /// Resolves `host` and keeps the IPv4 addresses.
     fn lookup_v4(&self, host: &str) -> Result<Vec<Ipv4Addr>, Error> {
-        let addresses = lookup_socket_addrs(host)?;
-        ipv4_from_addresses(host, addresses)
+        ipv4_from_addresses(host, socket_addrs(crate::resolve::lookup(host)?))
     }
 
-    /// Resolves `host` through the operating system and filters to IPv6.
+    /// Resolves `host` and keeps the IPv6 addresses.
     fn lookup_v6(&self, host: &str) -> Result<Vec<Ipv6Addr>, Error> {
-        let addresses = lookup_socket_addrs(host)?;
-        ipv6_from_addresses(host, addresses)
+        ipv6_from_addresses(host, socket_addrs(crate::resolve::lookup(host)?))
     }
 }
 
-fn lookup_socket_addrs(host: &str) -> Result<Vec<std::net::SocketAddr>, Error> {
-    (host, 0u16)
-        .to_socket_addrs()
-        .map(|addresses| addresses.collect())
-        .map_err(|err| Error::new(format!("resolve {host}: {err}")))
+fn socket_addrs(ips: Vec<IpAddr>) -> Vec<std::net::SocketAddr> {
+    ips.into_iter()
+        .map(|ip| std::net::SocketAddr::new(ip, 0))
+        .collect()
 }
 
 /// Tries each IPv4 echo URL in order. Skips answers that `is_publishable` rejects.
@@ -601,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn system_resolver_uses_os_lookup() {
+    fn system_resolver_handles_literals_and_address_families() {
         let resolver = SystemResolver;
         let ips = resolver.lookup_v4("127.0.0.1").unwrap();
         assert!(ips.iter().any(|ip| ip.is_loopback()));
@@ -638,6 +635,20 @@ mod tests {
         );
         let v6_ips = resolver.lookup_v6("::1").unwrap();
         assert!(v6_ips.iter().any(|ip| ip.is_loopback()));
+        assert!(
+            resolver
+                .lookup_v6("127.0.0.1")
+                .unwrap_err()
+                .to_string()
+                .contains("no AAAA record")
+        );
+        assert!(
+            resolver
+                .lookup_v4("::1")
+                .unwrap_err()
+                .to_string()
+                .contains("no A record")
+        );
         assert!(
             resolver
                 .lookup_v6("[")

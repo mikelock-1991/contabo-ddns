@@ -48,9 +48,45 @@ docker compose up -d
 
 Podman uses the same file: `podman compose up -d`. Log in to `ghcr.io` first when that package is private, then set `image` to `ghcr.io/mikelock-1991/contabo-ddns:latest`.
 
+DNS lookups use Hickory inside the binary, shared by HTTP requests and firewall source lookups. When `DNS_SERVERS` is unset or blank, the program tries system DNS first, including its search domains and `/etc/hosts`, with a two-second lookup deadline. Hickory uses standard peer validation and UDP with TCP fallback.
+
+If system DNS configuration cannot be loaded, or a lookup fails or times out, the program falls back to `1.1.1.1` and `8.8.8.8`. A warning identifies the failure and fallback servers, and explains that the `DNS_SERVERS` environment variable can override them. Valid negative DNS answers (NXDOMAIN or no records) are kept rather than retried against another service. Failure of the fallback is reported to the caller.
+
+Set a non-empty comma-separated list of IPv4/IPv6 nameserver IPs, for example `DNS_SERVERS=192.168.80.1,192.168.80.2`, to use those servers directly, and recreate the container. This bypasses system DNS entirely: `/etc/resolv.conf` is not read and its search domains are not used. `/etc/hosts` still applies. All servers use port 53. An info log identifies the configured servers. Invalid values fail startup, and lookup failures are reported without switching to system DNS or the public defaults.
+
+On Docker networks affected by replies from a different source port at `127.0.0.11`, explicit nameservers or the default fallback query upstream servers directly. No mounted `resolv.conf`, extra capabilities, or security changes are needed. Public DNS cannot resolve Docker service names or private records; set `DNS_SERVERS` to reachable internal servers when those names are needed. Outbound UDP/TCP port 53 must be allowed to the chosen servers.
+
 That Compose healthcheck runs `contabo-ddns health` every 30 seconds. Inside the container that is `GET /health` on `127.0.0.1:8080`, and the body `ok` means healthy. Do not publish the port. `HEALTHCHECK_BIND` can select another loopback address. Any other address is rejected. After the 15 second start period, `docker compose ps` shows `healthy`.
 
 Follow the log with `docker compose logs -f`.
+
+A named volume such as `contabo-ddns-logs` is created from the image directory, which is already owned by uid 65532. A host directory is not. Create it and give that user write access before using it as the log mount:
+
+```sh
+sudo install -d -o 65532 -g 65532 -m 750 /var/log/contabo-ddns
+```
+
+Rootless Podman maps container uids onto the host, so the same numbers have to be applied inside that mapping:
+
+```sh
+mkdir -p /var/log/contabo-ddns
+podman unshare chown 65532:65532 /var/log/contabo-ddns
+podman unshare chmod 750 /var/log/contabo-ddns
+```
+
+To leave the directory owned by root, add an ACL instead. `setfacl` comes from the `acl` package.
+
+```sh
+sudo install -d -m 755 /var/log/contabo-ddns
+sudo setfacl -m u:65532:rwx /var/log/contabo-ddns
+```
+
+Rootless Podman again applies the container uid, not the host uid:
+
+```sh
+mkdir -p /var/log/contabo-ddns
+podman unshare setfacl -m u:65532:rwx /var/log/contabo-ddns
+```
 
 ## Configure
 
@@ -78,6 +114,7 @@ At least one of DNS or the firewall must be enabled. Booleans accept `true`/`fal
 | `IP_ECHO_URL`             | `https://ipecho.net/plain`        | Comma-separated echo URLs, tried in order. IPv4 is requested like `curl -4`.                                                 |
 | `IPV6`                    | `false`                           | `true` also requests those URLs over IPv6 only, like `curl -6`.                                                              |
 | `IP_ECHO_TIMEOUT_SECONDS` | `10`                              | Seconds for each echo request. At least 1.                                                                                   |
+| `DNS_SERVERS`            | system DNS, then `1.1.1.1,8.8.8.8` | Non-empty: use these nameserver IPs directly, bypassing system DNS. Unset or blank: system DNS first, then public defaults on failure. |
 | `DNS_ENABLED`             | on when `DNS_RECORDS` is set      | `false` turns DNS off even when records are set.                                                                             |
 | `DNS_RECORDS`             | required while DNS is on          | Comma-separated hostnames.                                                                                                   |
 | `DNS_TTL`                 | API default                       | When set, at least 1.                                                                                                        |
@@ -107,7 +144,7 @@ IPv4 echo answers that are private, loopback, link-local, carrier-grade NAT (`10
 
 The runtime image is a [Docker Hardened Image](https://docs.docker.com/dhi/), `dhi.io/static`, Debian 13. That base is not a Linux distribution you can log into. It has a CA certificate bundle, a `nonroot` user, and nothing else: no shell, no package manager, and no extra libraries.
 
-The program is Rust, copied in as one statically linked musl binary. Published tags are multi-architecture manifests for `linux/amd64` and `linux/arm64`, so Apple Silicon and other arm64 hosts pull the arm64 image. A local `docker build` uses the machine's own architecture. The image also contains `/var/log/contabo-ddns`, owned by uid **65532** (gid 65532). That is the only path the process can write. A host bind mount for logs must be writable by uid 65532.
+The program is Rust, copied in as one statically linked musl binary. Published tags are multi-architecture manifests for `linux/amd64` and `linux/arm64`, so Apple Silicon and other arm64 hosts pull the arm64 image. A local `docker build` uses the machine's own architecture. The image also contains `/var/log/contabo-ddns`, owned by uid **65532** (gid 65532). That is the only path the process can write. A host bind mount has to be prepared with the `chown` or `setfacl` commands in [Run the published image](#run-the-published-image).
 
 The healthcheck runs `/usr/local/bin/contabo-ddns health`. The image has no shell and no curl, so Docker calls the binary. It requests `GET /health` on `HEALTHCHECK_BIND` and expects the body `ok`.
 
@@ -175,7 +212,7 @@ podman run --rm --env-file .env -e INTERVAL_SECONDS=0 -e LOG_DIR= \
   contabo-ddns
 ```
 
-A host bind mount must be writable by uid 65532:
+A host bind mount uses the directory prepared above. On Podman with SELinux, add `:Z` so the directory can be relabeled:
 
 ```sh
 podman run --rm --env-file .env -e INTERVAL_SECONDS=0 \
@@ -211,6 +248,17 @@ cargo coverage
 cargo check-fmt
 cargo lint
 ```
+
+The Docker CI job loads the production image and runs it on user-defined bridge and macvlan networks on both amd64 and arm64. Each network is tested with UDP DNS and truncated UDP replies requiring TCP. It verifies working system DNS with unset or blank `DNS_SERVERS`, explicit nameservers with unreadable or unreachable system DNS, startup logs, and rejection of malformed `DNS_SERVERS`. Local DNS and HTTPS fixtures verify upstream A/AAAA resolution, `/etc/hosts`, and the resulting DNS and firewall updates. The test uses dummy credentials and local DNS servers; it never contacts Contabo or public DNS.
+
+To run the same smoke test on a rootful Linux Docker host, build the image and run:
+
+```sh
+docker buildx build --load --tag contabo-ddns:ci .
+bash tests/docker/network-smoke.sh contabo-ddns:ci
+```
+
+The macvlan test creates and removes a dummy parent interface using `sudo ip`, so it does not need access to the host's physical network. It tests Docker's local macvlan DNS path; a particular LAN's routing or firewall configuration still needs testing on that LAN. The unusual Docker UDP reply-port case is covered separately by the Rust resolver tests.
 
 `cargo coverage` needs the `llvm-tools-preview` component and `cargo-llvm-cov`:
 
