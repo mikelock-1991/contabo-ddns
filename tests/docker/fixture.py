@@ -43,7 +43,7 @@ EXPECTED_FIREWALL = {
 
 
 def dns_reply(packet, protocol):
-    """Answer just the two synthetic external names; Docker owns API aliases."""
+    """Answer the synthetic API, echo, and firewall source names."""
     query_id, flags, questions, _, _, _ = struct.unpack("!6H", packet[:12])
     if questions != 1:
         raise ValueError("expected one DNS question")
@@ -60,7 +60,7 @@ def dns_reply(packet, protocol):
     kind, dns_class = struct.unpack("!HH", packet[cursor:cursor + 4])
     cursor += 4
     name = ".".join(labels).lower()
-    known = name in {"echo.ddns.test", "source.ddns.test"}
+    known = name in {"api.ddns.test", "auth.ddns.test", "echo.ddns.test", "source.ddns.test"}
     truncated = known and DNS_MODE == "tcp-fallback" and protocol == "udp"
     with LOCK:
         DNS_CALLS.add((protocol, name, kind))
@@ -69,7 +69,7 @@ def dns_reply(packet, protocol):
     address = None
     if known and dns_class == 1 and not truncated:
         if kind == 1:
-            address = FIXTURE_IP if name == "echo.ddns.test" else PUBLIC_IP
+            address = PUBLIC_IP if name == "source.ddns.test" else FIXTURE_IP
         elif kind == 28 and name == "source.ddns.test":
             address = SOURCE_IPV6
     if address:
