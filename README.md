@@ -1,19 +1,36 @@
 # contabo-ddns
 
-Rust program that updates Contabo DNS A and AAAA records and the IPv4 and IPv6 sources of named firewall rules. The published container is a static binary on a [Docker Hardened Image](https://docs.docker.com/dhi/). Run it on the network whose public address should be published. On the Contabo VPS, the echo service returns the VPS address. At home, it returns the home address. IPv6 stays off until `IPV6=true`.
+Updates Contabo DNS A and AAAA records and the IPv4 and IPv6 sources of named firewall rules to this machine's public address. Run it on the network whose address should be published: a Contabo VPS publishes the VPS address; a machine at home publishes the home address. IPv6 stays off until `IPV6=true`.
 
-## Run the published image
+The image contains a static Rust binary on a [Docker Hardened Image](https://docs.docker.com/dhi/). It runs as uid/gid **65532:65532** and has no shell. The Compose example below uses a read-only root filesystem, drops all capabilities, and enables `no-new-privileges`. Logs are the only persistent data.
 
-Pull a published tag. That pull does not use `dhi.io`. `latest` tracks `main` and is a multi-architecture image for `linux/amd64` and `linux/arm64`, including Apple Silicon. The same tags are on GHCR and Docker Hub:
+Images are available on [Docker Hub](https://hub.docker.com/r/mikelockengineering/contabo-ddns) and GHCR:
 
-- `ghcr.io/mikelock-1991/contabo-ddns`
 - `docker.io/mikelockengineering/contabo-ddns`
+- `ghcr.io/ml-engineering-nl/contabo-ddns`
 
-```sh
-cp .env.example .env
+`latest` tracks `main`; `beta` tracks `dev`. Releases also have version tags, with prereleases named `<version>-beta.N`. Published images support `linux/amd64` and `linux/arm64`, including Apple Silicon. Pulling a published image does not require access to `dhi.io`.
+
+[Source code](https://github.com/ml-engineering-nl/contabo-ddns) | [Full environment example](https://github.com/ml-engineering-nl/contabo-ddns/blob/main/.env.example) | [MIT license](https://github.com/ml-engineering-nl/contabo-ddns/blob/main/LICENSE)
+
+## Installation
+
+The same Compose file and `.env` work with Docker and Podman. No source checkout is needed.
+
+Create a `.env` file next to `compose.yaml`. Fill in the four credentials from the API credentials area of the Contabo customer panel, and replace `home.example.com` with a record in your Contabo DNS zone:
+
+```dotenv
+CONTABO_CLIENT_ID=
+CONTABO_CLIENT_SECRET=
+CONTABO_API_USER=
+CONTABO_API_PASSWORD=
+
+DNS_RECORDS=home.example.com
 ```
 
-Fill in the four Contabo credentials. Save this next to `.env` as `compose.yaml`. If this repository is already checked out, remove `build` from the existing file and set `image` as shown.
+This minimal configuration updates DNS. Firewall updates and IPv6 can be enabled in the configuration below. The DNS zone must already exist in your Contabo account.
+
+Save this as `compose.yaml`:
 
 ```yaml
 services:
@@ -42,31 +59,160 @@ volumes:
   contabo-ddns-logs:
 ```
 
+Start the service and follow its logs:
+
 ```sh
 docker compose up -d
+docker compose logs -f
 ```
 
-Podman uses the same file: `podman compose up -d`. Log in to `ghcr.io` first when that package is private, then set `image` to `ghcr.io/mikelock-1991/contabo-ddns:latest`.
+With Podman, use `podman compose up -d` and `podman compose logs -f` instead. To pull from GHCR, change `image` to `ghcr.io/ml-engineering-nl/contabo-ddns:latest`; sign in to `ghcr.io` first if the package is private.
 
-DNS lookups use Hickory inside the binary, shared by HTTP requests and firewall source lookups. When `DNS_SERVERS` is unset or blank, the program tries system DNS first, including its search domains and `/etc/hosts`, with a two-second lookup deadline. Hickory uses standard peer validation and UDP with TCP fallback.
+## Configuration
 
-If system DNS configuration cannot be loaded, or a lookup fails or times out, the program falls back to `1.1.1.1` and `8.8.8.8`. A warning identifies the failure and fallback servers, and explains that the `DNS_SERVERS` environment variable can override them. Valid negative DNS answers (NXDOMAIN or no records) are kept rather than retried against another service. Failure of the fallback is reported to the caller.
+Edit `.env` to select the DNS records and firewall rules to update. At least one must be enabled. After changing `.env`, recreate the container so it receives the new environment:
 
-Set a non-empty comma-separated list of IPv4/IPv6 nameserver IPs, for example `DNS_SERVERS=192.168.80.1,192.168.80.2`, to use those servers directly, and recreate the container. This bypasses system DNS entirely: `/etc/resolv.conf` is not read and its search domains are not used. `/etc/hosts` still applies. All servers use port 53. An info log identifies the configured servers. Invalid values fail startup, and lookup failures are reported without switching to system DNS or the public defaults.
+```sh
+docker compose up -d --force-recreate
+```
 
-On Docker networks affected by replies from a different source port at `127.0.0.11`, explicit nameservers or the default fallback query upstream servers directly. No mounted `resolv.conf`, extra capabilities, or security changes are needed. Public DNS cannot resolve Docker service names or private records; set `DNS_SERVERS` to reachable internal servers when those names are needed. Outbound UDP/TCP port 53 must be allowed to the chosen servers.
+### DNS records
 
-That Compose healthcheck runs `contabo-ddns health` every 30 seconds. Inside the container that is `GET /health` on `127.0.0.1:8080`, and the body `ok` means healthy. Do not publish the port. `HEALTHCHECK_BIND` can select another loopback address. Any other address is rejected. After the 15 second start period, `docker compose ps` shows `healthy`.
+`DNS_RECORDS` is a comma-separated list of record names:
 
-Follow the log with `docker compose logs -f`.
+```dotenv
+DNS_RECORDS=home.example.com,example.com,*.example.net
+```
 
-A named volume such as `contabo-ddns-logs` is created from the image directory, which is already owned by uid 65532. A host directory is not. Create it and give that user write access before using it as the log mount:
+- `home.example.com` updates that exact record.
+- `example.com` is the zone apex, written as `@` in the API.
+- `*.example.net` updates existing matching records in that zone and its children.
+
+A records are updated when the public IPv4 address is known. AAAA records are also updated when `IPV6=true` and the public IPv6 address is known. Other record types are left alone. `DNS_CREATE_MISSING=true` creates a missing A or AAAA record for an exact name; wildcards never create records.
+
+### Firewall rules
+
+Add the firewall name and the rules whose sources should be replaced:
+
+```dotenv
+FIREWALL_NAME=web
+FIREWALL_RULES=[{"displayName":"SSH","sources":["203.0.113.5","home.example.net","current"]}]
+```
+
+A source can be an IP address, a CIDR, a hostname, `current`, or `current6`. `current` uses the public IPv4 echo answer. `current6` uses the IPv6 answer and requires `IPV6=true`. A hostname contributes one `/32` per A record and one `/128` per AAAA record. Duplicates are removed while preserving order.
+
+Set exactly one of `FIREWALL_NAME` or `FIREWALL_ID`. Names must match the firewall and rule display names exactly. IPv4 sources replace only the rule's IPv4 list; IPv6 sources replace only its IPv6 list. The other address family, other rules, and unknown fields are preserved. An unresolved hostname, missing rule, or empty source list prevents the firewall update.
+
+For firewall-only operation, set `DNS_ENABLED=false`. DNS-only operation is the default when `DNS_RECORDS` is set and `FIREWALL_RULES` is absent.
+
+### IPv6
+
+Set `IPV6=true` to fetch the public IPv6 address and update AAAA records alongside A records. Include `current6` in a firewall rule's sources to publish that address there too. With IPv6 disabled, AAAA records are left unchanged and `current6` is rejected.
+
+### DNS resolution
+
+`DNS_RECORDS` selects records to update. `DNS_SERVERS` selects the nameservers used for outbound hostname lookups, including HTTP requests and firewall source hostnames.
+
+- **`DNS_SERVERS` is unset, empty, or whitespace-only:** try system DNS first, with a two-second lookup deadline. If configuration cannot be loaded or a lookup fails or times out, use `1.1.1.1` and `8.8.8.8`. A warning identifies the failure and defaults, and explains how to override them.
+- **`DNS_SERVERS` is non-empty:** use only those servers and skip system DNS configuration entirely. For example, `DNS_SERVERS=192.168.80.1,192.168.80.2`. An info log identifies the selected servers. Invalid values fail startup; lookup failures are reported without switching to system DNS or public defaults.
+
+The server list accepts comma-separated IPv4/IPv6 addresses on port 53. Explicit servers and the default fallback do not read `/etc/resolv.conf` or use its search domains. `/etc/hosts` applies in both modes. Valid negative DNS answers, such as NXDOMAIN or no records, do not trigger fallback.
+
+On Docker networks affected by replies from a different source port at `127.0.0.11`, explicit servers or the default fallback query upstream nameservers directly. No resolver-file mount or extra capabilities are needed. Public DNS cannot resolve Docker service names or private records, so choose reachable internal servers when those names are required. Allow outbound UDP/TCP port 53 to the selected servers.
+
+## Environment variables
+
+Required values cannot be blank or whitespace-only. Booleans accept `true`/`false`, `yes`/`no`, `on`/`off`, or `1`/`0`, without regard to case. At least one of DNS or the firewall must be enabled. `CONTABO_API_BASE`, `CONTABO_AUTH_URL`, and every `IP_ECHO_URL` must start with `https://`.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CONTABO_CLIENT_ID` | required | OAuth client id. Trimmed. |
+| `CONTABO_CLIENT_SECRET` | required | OAuth client secret. Not trimmed. |
+| `CONTABO_API_USER` | required | API user email. Trimmed. |
+| `CONTABO_API_PASSWORD` | required | API password. Not trimmed. |
+| `CONTABO_API_BASE` | `https://api.contabo.com` | API origin. |
+| `CONTABO_AUTH_URL` | `https://auth.contabo.com/auth/realms/contabo/protocol/openid-connect/token` | OAuth token URL. |
+| `RUN_ON_START` | `true` | `false` waits `INTERVAL_SECONDS` before the first sync. |
+| `INTERVAL_SECONDS` | `300` | Seconds between cycles. `0` runs once and exits. Any other value must be at least 30. `RUN_ON_START=false` combined with `0` is rejected. |
+| `DRY_RUN` | `false` | Log the DNS and firewall writes and skip POST, PATCH, and PUT. |
+| `IP_ECHO_URL` | `https://ipecho.net/plain` | Comma-separated echo URLs, tried in order. IPv4 is requested like `curl -4`. |
+| `IPV6` | `false` | `true` also requests those URLs over IPv6 only, like `curl -6`. |
+| `IP_ECHO_TIMEOUT_SECONDS` | `10` | Seconds for each echo request. At least 1. |
+| `DNS_SERVERS` | unset | Non-empty: use these nameserver IPs directly, bypassing system DNS. Unset or blank: system DNS first, then public defaults on failure. |
+| `DNS_ENABLED` | on when `DNS_RECORDS` is set | `true` requires `DNS_RECORDS`; `false` disables DNS updates. |
+| `DNS_RECORDS` | required while DNS is on | Comma-separated hostnames. |
+| `DNS_TTL` | API default | When set, at least 1. |
+| `DNS_CREATE_MISSING` | `false` | Create a missing A or AAAA record for an exact name only. |
+| `FIREWALL_ENABLED` | on when `FIREWALL_RULES` is set | `true` requires `FIREWALL_RULES`; `false` disables firewall updates. |
+| `FIREWALL_ID` | one of id or name | Firewall id. |
+| `FIREWALL_NAME` | one of id or name | Exact firewall name. |
+| `FIREWALL_RULES` | required while the firewall is on | JSON array of `displayName` and `sources`. |
+| `TLS_ROOTS` | `both` | `both`, `webpki`, or `native`. |
+| `LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug`, or `trace`. |
+| `LOG_DIR` | `/var/log/contabo-ddns` | Empty string logs to stdout only. |
+| `LOG_FILE` | `contabo-ddns.log` | File name, not a path. |
+| `LOG_ROTATE_SIZE_MB` | `10` | Megabytes before the file rolls. At least 1. |
+| `LOG_ROTATE_KEEP` | `5` | Rolled files to keep, from 1 to 10000. |
+| `LOG_TO_STDOUT` | `true` | `false` requires a non-empty `LOG_DIR`. |
+| `HEALTHCHECK_BIND` | `127.0.0.1:8080` | Loopback address for `GET /health`. A non-loopback address is rejected. Do not publish the port. |
+
+## Running without Compose
+
+Use the `.env` file from the installation section:
+
+```sh
+docker run -d --name contabo-ddns --init --env-file .env \
+  -v contabo-ddns-logs:/var/log/contabo-ddns \
+  --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+  --restart unless-stopped --stop-timeout 45 \
+  docker.io/mikelockengineering/contabo-ddns:latest
+```
+
+Replace `docker` with `podman` for the same commands on Podman.
+
+One sync, then exit:
+
+```sh
+docker run --rm --init --env-file .env -e INTERVAL_SECONDS=0 \
+  -v contabo-ddns-logs:/var/log/contabo-ddns \
+  --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+  docker.io/mikelockengineering/contabo-ddns:latest
+```
+
+One sync with stdout logging and no volume:
+
+```sh
+docker run --rm --init --env-file .env -e INTERVAL_SECONDS=0 -e LOG_DIR= \
+  --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+  docker.io/mikelockengineering/contabo-ddns:latest
+```
+
+## Operations
+
+### Healthcheck
+
+The image healthcheck runs `contabo-ddns health` every 30 seconds. It requests `GET /health` at `127.0.0.1:8080` and expects `ok`. After the 15-second start period, `docker compose ps` reports the health status. Check logs for sync failures; the endpoint reports process availability.
+
+Keep this port private. `HEALTHCHECK_BIND` accepts only loopback addresses. The image has no shell or curl, so the healthcheck calls the program directly.
+
+### Logs and storage
+
+Logs go to stdout and `/var/log/contabo-ddns` by default. Set `LOG_DIR=` to use stdout only. File logs rotate according to `LOG_ROTATE_SIZE_MB` and `LOG_ROTATE_KEEP`.
+
+The recommended named volume is initialized from the image directory, which is owned by uid/gid 65532. A host bind mount must be prepared separately:
 
 ```sh
 sudo install -d -o 65532 -g 65532 -m 750 /var/log/contabo-ddns
 ```
 
-Rootless Podman maps container uids onto the host, so the same numbers have to be applied inside that mapping:
+To retain root ownership, grant write access with an ACL (`setfacl` comes from the `acl` package):
+
+```sh
+sudo install -d -m 755 /var/log/contabo-ddns
+sudo setfacl -m u:65532:rwx /var/log/contabo-ddns
+```
+
+Rootless Podman applies container uids inside its user namespace:
 
 ```sh
 mkdir -p /var/log/contabo-ddns
@@ -74,161 +220,39 @@ podman unshare chown 65532:65532 /var/log/contabo-ddns
 podman unshare chmod 750 /var/log/contabo-ddns
 ```
 
-To leave the directory owned by root, add an ACL instead. `setfacl` comes from the `acl` package.
+Or retain ownership and grant an ACL inside that namespace:
 
 ```sh
-sudo install -d -m 755 /var/log/contabo-ddns
-sudo setfacl -m u:65532:rwx /var/log/contabo-ddns
-```
-
-Rootless Podman again applies the container uid, not the host uid:
-
-```sh
-mkdir -p /var/log/contabo-ddns
 podman unshare setfacl -m u:65532:rwx /var/log/contabo-ddns
 ```
 
-## Configure
+On a host with SELinux, use `:Z` on the bind mount so the directory can be relabeled:
 
 ```sh
-cp .env.example .env
-```
-
-Fill in the four Contabo credentials from the customer panel (API section): client id, client secret, API user, and API password. Blank or whitespace-only values are rejected.
-
-At least one of DNS or the firewall must be enabled. Booleans accept `true`/`false`, `yes`/`no`, `on`/`off`, or `1`/`0`. Case does not matter.
-
-`CONTABO_API_BASE`, `CONTABO_AUTH_URL`, and every echo URL must start with `https://`.
-
-| Variable                  | Default                           | Purpose                                                                                                                      |
-| ------------------------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `CONTABO_CLIENT_ID`       | required                          | OAuth client id. Trimmed.                                                                                                    |
-| `CONTABO_CLIENT_SECRET`   | required                          | OAuth client secret. Not trimmed.                                                                                            |
-| `CONTABO_API_USER`        | required                          | API user email. Trimmed.                                                                                                     |
-| `CONTABO_API_PASSWORD`    | required                          | API password. Not trimmed.                                                                                                   |
-| `CONTABO_API_BASE`        | `https://api.contabo.com`         | API origin.                                                                                                                  |
-| `CONTABO_AUTH_URL`        | Contabo token endpoint            | OAuth token URL.                                                                                                             |
-| `RUN_ON_START`            | `true`                            | `false` waits `INTERVAL_SECONDS` before the first sync.                                                                      |
-| `INTERVAL_SECONDS`        | `300`                             | Seconds between cycles. `0` runs once and exits. Any other value must be at least 30. `false` combined with `0` is rejected. |
-| `DRY_RUN`                 | `false`                           | Log the DNS and firewall writes and skip POST, PATCH, and PUT.                                                               |
-| `IP_ECHO_URL`             | `https://ipecho.net/plain`        | Comma-separated echo URLs, tried in order. IPv4 is requested like `curl -4`.                                                 |
-| `IPV6`                    | `false`                           | `true` also requests those URLs over IPv6 only, like `curl -6`.                                                              |
-| `IP_ECHO_TIMEOUT_SECONDS` | `10`                              | Seconds for each echo request. At least 1.                                                                                   |
-| `DNS_SERVERS`            | system DNS, then `1.1.1.1,8.8.8.8` | Non-empty: use these nameserver IPs directly, bypassing system DNS. Unset or blank: system DNS first, then public defaults on failure. |
-| `DNS_ENABLED`             | on when `DNS_RECORDS` is set      | `false` turns DNS off even when records are set.                                                                             |
-| `DNS_RECORDS`             | required while DNS is on          | Comma-separated hostnames.                                                                                                   |
-| `DNS_TTL`                 | API default                       | When set, at least 1.                                                                                                        |
-| `DNS_CREATE_MISSING`      | `false`                           | Create a missing A or AAAA record for an exact name only.                                                                    |
-| `FIREWALL_ENABLED`        | on when `FIREWALL_RULES` is set   | `false` turns the firewall off even when rules are set.                                                                      |
-| `FIREWALL_ID`             | one of id or name                 | Firewall id.                                                                                                                 |
-| `FIREWALL_NAME`           | one of id or name                 | Exact firewall name.                                                                                                         |
-| `FIREWALL_RULES`          | required while the firewall is on | JSON array of `displayName` and `sources`.                                                                                   |
-| `TLS_ROOTS`               | `both`                            | `both`, `webpki`, or `native`.                                                                                               |
-| `LOG_LEVEL`               | `info`                            | `error`, `warn`, `info`, `debug`, or `trace`.                                                                                |
-| `LOG_DIR`                 | `/var/log/contabo-ddns`           | Empty string logs to stdout only.                                                                                            |
-| `LOG_FILE`                | `contabo-ddns.log`                | File name, not a path.                                                                                                       |
-| `LOG_ROTATE_SIZE_MB`      | `10`                              | Megabytes before the file rolls. At least 1.                                                                                 |
-| `LOG_ROTATE_KEEP`         | `5`                               | Rolled files to keep, from 1 to 10000.                                                                                       |
-| `LOG_TO_STDOUT`           | `true`                            | `false` requires a non-empty `LOG_DIR`.                                                                                      |
-| `HEALTHCHECK_BIND`        | `127.0.0.1:8080`                  | Loopback address for `GET /health`. A non-loopback address is rejected. Do not publish the port.                             |
-
-`home.example.com` updates that A record when a public IPv4 address is known, and that AAAA record when a public IPv6 address is known. `example.com` is the zone apex and is written as `@`. `*.example.com` updates existing A and AAAA records in that zone and its children. Wildcards do not create records. Other record types are left alone. With `IPV6` left false, AAAA records stay as they are.
-
-A firewall source is an IPv4 or IPv6 address, a CIDR, a hostname, `current`, or `current6`. A hostname contributes one `/32` per A record and one `/128` per AAAA record. `current` is the IPv4 answer from `IP_ECHO_URL`. `current6` is the IPv6 answer and requires `IPV6=true`. IPv4 sources replace `srcCidr.ipv4` only, and IPv6 sources replace `srcCidr.ipv6` only. The other family is left as it is. Set exactly one of `FIREWALL_ID` or `FIREWALL_NAME`. Duplicate sources are dropped and the remaining order is kept.
-
-`TLS_ROOTS=both` uses the embedded Mozilla roots and the image CA bundle. `webpki` uses only the embedded roots. `native` uses only the bundle.
-
-IPv4 echo answers that are private, loopback, link-local, carrier-grade NAT (`100.64.0.0/10`), or benchmarking (`198.18.0.0/15`) are skipped. IPv6 answers that are loopback, link-local, unique-local, documentation (`2001:db8::/32`), benchmarking (`2001:2::/48`), discard-only (`100::/64`), or IPv4-mapped are skipped.
-
-## Image
-
-The runtime image is a [Docker Hardened Image](https://docs.docker.com/dhi/), `dhi.io/static`, Debian 13. That base is not a Linux distribution you can log into. It has a CA certificate bundle, a `nonroot` user, and nothing else: no shell, no package manager, and no extra libraries.
-
-The program is Rust, copied in as one statically linked musl binary. Published tags are multi-architecture manifests for `linux/amd64` and `linux/arm64`, so Apple Silicon and other arm64 hosts pull the arm64 image. A local `docker build` uses the machine's own architecture. The image also contains `/var/log/contabo-ddns`, owned by uid **65532** (gid 65532). That is the only path the process can write. A host bind mount has to be prepared with the `chown` or `setfacl` commands in [Run the published image](#run-the-published-image).
-
-The healthcheck runs `/usr/local/bin/contabo-ddns health`. The image has no shell and no curl, so Docker calls the binary. It requests `GET /health` on `HEALTHCHECK_BIND` and expects the body `ok`.
-
-Building the image pulls the builder and the runtime from `dhi.io`. That requires a free Docker Hub account:
-
-```sh
-docker login dhi.io
-```
-
-Podman uses `podman login dhi.io`. The published image is a normal image on GHCR and Docker Hub. Pulling `latest` or a version tag does not use `dhi.io`.
-
-`docker exec` and `podman exec` cannot open a shell in this image. Read the container log, or the files in the log volume. Compose sets `init: true` because the image has no init process of its own. It also sets a read-only root filesystem, drops all capabilities, and sets `no-new-privileges`.
-
-`TLS_ROOTS=both` uses the Mozilla roots built into the binary and the CA bundle from the image. `webpki` uses only the built-in roots. `native` uses only the bundle.
-
-## Run
-
-This builds from source. Pulling a published image is described above. Log in to `dhi.io` before the first build. From this directory, with `.env` in place:
-
-```sh
-podman compose up -d --build
-```
-
-Docker uses the same [compose.yaml](compose.yaml):
-
-```sh
-docker compose up -d --build
-```
-
-Compose names the image `contabo-ddns`, restarts it unless it is stopped, and mounts the `contabo-ddns-logs` volume on `/var/log/contabo-ddns`. `stop_grace_period` is 45 seconds, which is longer than one 30 second HTTP timeout.
-
-A published image is `ghcr.io/mikelock-1991/contabo-ddns` and `docker.io/mikelockengineering/contabo-ddns`. `latest` tracks `main` and is also tagged with the `Cargo.toml` version, for example `0.1.4`. Every push to `dev`, including a merged pull request, publishes a new prerelease `0.1.4-beta.1`, `0.1.4-beta.2`, and so on. The moving tag for that series is `beta`. After `v0.1.4` exists on `main`, the next `dev` publish starts at `0.1.5-beta.1`. The deploy workflow logs in to Docker Hub with the `DOCKERHUB_USERNAME` variable and the `DOCKERHUB_TOKEN` secret (a Docker Hub access token with write access). Set both on the repository, or on the `main` and `dev` environments. The same credentials log in to `dhi.io` so the build can pull the hardened base. The finished image is pushed to Docker Hub and to GHCR. The deploy workflow signs each copy with Sigstore, using the GitHub Actions identity for `.github/workflows/deploy.yml`. No signing key is stored. Check a tag before running it:
-
-```sh
-cosign verify \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity-regexp '^https://github.com/mikelock-1991/contabo-ddns/\.github/workflows/deploy\.yml@' \
-  ghcr.io/mikelock-1991/contabo-ddns:latest
-```
-
-The Docker Hub tag uses the same command with `docker.io/mikelockengineering/contabo-ddns:latest`.
-
-After the image starts and exits 2 with an empty environment, the workflow creates or updates GitHub Release `v<version>` on the commit that was built. A `dev` publish stays a prerelease. A `main` publish marks that same release as the latest. The notes are regenerated on every publish from the commits since the previous version tag. The automatic patch-bump commit is omitted. Log in first when the GitHub package is private:
-
-```sh
-podman login ghcr.io
-podman run -d --name contabo-ddns --env-file .env \
-  -v contabo-ddns-logs:/var/log/contabo-ddns \
-  --read-only --cap-drop=ALL --security-opt=no-new-privileges \
-  ghcr.io/mikelock-1991/contabo-ddns:latest
-```
-
-One sync, then exit:
-
-```sh
-podman run --rm --env-file .env -e INTERVAL_SECONDS=0 \
-  -v contabo-ddns-logs:/var/log/contabo-ddns \
-  contabo-ddns
-```
-
-Stdout only, with no log volume:
-
-```sh
-podman run --rm --env-file .env -e INTERVAL_SECONDS=0 -e LOG_DIR= \
-  contabo-ddns
-```
-
-A host bind mount uses the directory prepared above. On Podman with SELinux, add `:Z` so the directory can be relabeled:
-
-```sh
-podman run --rm --env-file .env -e INTERVAL_SECONDS=0 \
+podman run --rm --init --env-file .env -e INTERVAL_SECONDS=0 \
   -v /var/log/contabo-ddns:/var/log/contabo-ddns:Z \
-  contabo-ddns
+  --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+  docker.io/mikelockengineering/contabo-ddns:latest
 ```
 
-Follow the container log:
+### Updates and shutdown
+
+Pull the selected tag and recreate the service:
 
 ```sh
-podman compose logs -f
+docker compose pull
+docker compose up -d
 ```
 
-`SIGTERM` and `SIGINT` stop the process during the sleep between cycles and cut a retry pause short. Compose sets `init: true` so the container still reaps child processes. `podman compose down` removes the container and keeps the log volume. `podman compose down -v` deletes that volume too.
+`docker compose down` removes the container and keeps the log volume. Adding `-v` also deletes that volume. The same commands work with `podman compose`.
 
-Exit code 2 means the environment or the log directory was rejected. Exit code 1 means a one-shot cycle failed. Exit code 0 means a one-shot cycle succeeded, or a looping process was stopped.
+`SIGTERM` and `SIGINT` interrupt sleep and retry waits. An in-flight HTTP request can take up to 30 seconds; the Compose example allows 45 seconds to stop. `init: true` provides child-process reaping.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | One-shot cycle succeeded, or the looping process was stopped. |
+| `1` | One-shot cycle failed, or startup could not create the healthcheck listener or HTTP/DNS client. |
+| `2` | Environment validation or log setup failed. |
 
 ## What a cycle does
 
@@ -240,7 +264,51 @@ If the IPv4 lookup fails, A records are left unchanged and the cycle reports an 
 
 The matching firewall rule's configured address family is replaced. A rule with only IPv4 sources leaves `srcCidr.ipv6` unchanged, and a rule with only IPv6 sources leaves `srcCidr.ipv4` unchanged. Other rules and unknown fields are copied through. If a rule name is missing, a hostname does not resolve, or the new source list would be empty, the firewall is not updated. A name lookup is cached until a GET for that id returns 404. A firewall PUT replaces the whole inbound rule list from the last GET, so a console edit made during that window can be overwritten.
 
-## Tests
+## Image and security
+
+The runtime uses `dhi.io/static`, Debian 13, with a CA certificate bundle and a nonroot user. The program is a statically linked musl binary. There is no shell, package manager, or init process in the image. Use container logs or the mounted log files for diagnostics.
+
+The recommended Compose file makes the root filesystem read-only, drops all capabilities, and enables `no-new-privileges`. The log volume provides writable storage for application logs. No incoming ports need to be published.
+
+`TLS_ROOTS=both` combines the embedded Mozilla roots with the image CA bundle. `webpki` uses only the embedded roots; `native` uses only the bundle.
+
+IPv4 echo answers that are private, loopback, link-local, carrier-grade NAT (`100.64.0.0/10`), or benchmarking (`198.18.0.0/15`) are skipped. IPv6 answers that are loopback, link-local, unique-local, documentation (`2001:db8::/32`), benchmarking (`2001:2::/48`), discard-only (`100::/64`), or IPv4-mapped are skipped.
+
+### Verify image signatures
+
+The release workflow signs images with Sigstore using its GitHub Actions identity. No signing key is stored. Verify a published tag with cosign:
+
+```sh
+cosign verify \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github.com/ml-engineering-nl/contabo-ddns/\.github/workflows/deploy\.yml@' \
+  docker.io/mikelockengineering/contabo-ddns:latest
+```
+
+For a GHCR image, use the same command with `ghcr.io/ml-engineering-nl/contabo-ddns:latest`.
+
+## Build from source
+
+The repository's [compose.yaml](https://github.com/ml-engineering-nl/contabo-ddns/blob/main/compose.yaml) builds the local image. Clone the source and create the environment file:
+
+```sh
+git clone https://github.com/ml-engineering-nl/contabo-ddns.git
+cd contabo-ddns
+cp .env.example .env
+```
+
+Fill in `.env` as described above. Building pulls the builder and runtime images from `dhi.io`, so sign in with an account that has access to those base images:
+
+```sh
+docker login dhi.io
+docker compose up -d --build
+```
+
+With Podman, use `podman login dhi.io` and `podman compose up -d --build`. A local build targets the host's architecture.
+
+## Development and publishing
+
+### Tests
 
 ```sh
 cargo test
@@ -249,31 +317,39 @@ cargo check-fmt
 cargo lint
 ```
 
-The Docker CI job loads the production image and runs it on user-defined bridge and macvlan networks on both amd64 and arm64. Each network is tested with UDP DNS and truncated UDP replies requiring TCP. It verifies working system DNS with unset or blank `DNS_SERVERS`, explicit nameservers with unreadable or unreachable system DNS, startup logs, and rejection of malformed `DNS_SERVERS`. Local DNS and HTTPS fixtures verify upstream A/AAAA resolution, `/etc/hosts`, and the resulting DNS and firewall updates. The test uses dummy credentials and local DNS servers; it never contacts Contabo or public DNS.
+The Docker CI job loads the production image and runs it on user-defined bridge and macvlan networks on both amd64 and arm64. Each network is tested with UDP DNS and truncated UDP replies requiring TCP. It verifies working system DNS with unset or blank `DNS_SERVERS`, explicit nameservers with unreadable or unreachable system DNS, startup logs, and rejection of malformed `DNS_SERVERS`. Local DNS and HTTPS fixtures verify A/AAAA resolution, `/etc/hosts`, and the resulting DNS and firewall updates. The image smoke test uses dummy credentials and local DNS servers; it never contacts Contabo or public DNS.
 
-To run the same smoke test on a rootful Linux Docker host, build the image and run:
+To run the image smoke test on a rootful Linux Docker host:
 
 ```sh
 docker buildx build --load --tag contabo-ddns:ci .
 bash tests/docker/network-smoke.sh contabo-ddns:ci
 ```
 
-The macvlan test creates and removes a dummy parent interface using `sudo ip`, so it does not need access to the host's physical network. It tests Docker's local macvlan DNS path; a particular LAN's routing or firewall configuration still needs testing on that LAN. The unusual Docker UDP reply-port case is covered separately by the Rust resolver tests.
+The macvlan test creates and removes a dummy parent interface using `sudo ip`. A particular LAN's routing and firewall configuration still need testing on that LAN. Rust tests cover system DNS success and failure, explicit-server precedence, default fallback, and lookup deadlines.
 
-`cargo coverage` needs the `llvm-tools-preview` component and `cargo-llvm-cov`:
+`cargo coverage` requires `llvm-tools-preview` and `cargo-llvm-cov`:
 
 ```sh
 rustup component add llvm-tools-preview
 cargo install cargo-llvm-cov --locked
 ```
 
-`cargo audit` checks `Cargo.lock` against the RustSec advisory database:
+Check the dependency lockfile against the RustSec advisory database:
 
 ```sh
 cargo install cargo-audit --locked
 cargo audit
 ```
 
+### Release workflow
+
+Pushes to `main` and `dev` publish multi-architecture images to Docker Hub and GHCR. Each `dev` publish gets a numbered `<version>-beta.N` prerelease and moves the `beta` tag. Main releases move `latest`. The workflow creates or updates GitHub Release `v<version>` on the built commit and regenerates release notes; the automatic patch-bump commit is omitted from the notes.
+
+Set `DOCKERHUB_USERNAME` as a variable and `DOCKERHUB_TOKEN` as a secret with write access on the repository or its `main` and `dev` environments. The workflow also uses those credentials to pull base images from `dhi.io`; `GITHUB_TOKEN` handles GHCR access. Each registry copy is signed with the deploy workflow's GitHub Actions identity.
+
+This README is intended for both GitHub and the Docker Hub overview. The current deploy workflow publishes images but does not update the Docker Hub overview, so copy this same Markdown there when documentation changes.
+
 ---
 
-Powered by https://ml-engineering.nl
+[MIT license](https://github.com/ml-engineering-nl/contabo-ddns/blob/main/LICENSE) | [Powered by ML Engineering](https://ml-engineering.nl)
