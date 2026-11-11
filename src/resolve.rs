@@ -13,7 +13,7 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use hickory_resolver::config::LookupIpStrategy;
+use hickory_resolver::config::{LookupIpStrategy, NameServerConfig, ResolverConfig, ResolverOpts};
 use hickory_resolver::lookup_ip::LookupIp;
 use hickory_resolver::net::NetError;
 use hickory_resolver::net::runtime::{DnsUdpSocket, RuntimeProvider, TokioRuntimeProvider};
@@ -41,7 +41,7 @@ pub(crate) struct HostResolver {
 }
 
 impl HostResolver {
-    /// Uses the OS DNS configuration without falling back to public resolvers.
+    /// Uses the OS configuration, or Docker's resolver if its file is unreadable.
     pub(crate) fn system() -> Result<Self, Error> {
         system_from(&SYSTEM)
     }
@@ -61,7 +61,10 @@ impl HostResolver {
 fn system_from(cache: &OnceLock<Result<HostResolver, Error>>) -> Result<HostResolver, Error> {
     match cache.get_or_init(|| {
         build(
-            DnsResolver::builder(DockerRuntime::default()),
+            system_builder(
+                DnsResolver::builder(DockerRuntime::default()),
+                std::path::Path::new("/.dockerenv").is_file(),
+            ),
             Builder::new_multi_thread()
                 .worker_threads(1)
                 .thread_name("dns")
@@ -72,6 +75,39 @@ fn system_from(cache: &OnceLock<Result<HostResolver, Error>>) -> Result<HostReso
         Ok(resolver) => Ok(resolver.clone()),
         Err(err) => Err(Error::new(err.to_string())),
     }
+}
+
+/// A Docker-managed resolver file can be inaccessible to the image's nonroot
+/// user. Only that access error inside Docker selects the known local stub;
+/// missing/invalid configuration and errors outside Docker remain fatal.
+fn system_builder(
+    builder: Result<ResolverBuilder<DockerRuntime>, NetError>,
+    docker: bool,
+) -> Result<ResolverBuilder<DockerRuntime>, NetError> {
+    match builder {
+        Err(NetError::Io(err)) if docker && err.kind() == io::ErrorKind::PermissionDenied => {
+            log::warn!(
+                "cannot read /etc/resolv.conf; using Docker DNS {DOCKER_DNS}; search domains are unavailable"
+            );
+            let (config, options) = docker_config();
+            Ok(
+                DnsResolver::builder_with_config(config, DockerRuntime::default())
+                    .with_options(options),
+            )
+        }
+        other => other,
+    }
+}
+
+fn docker_config() -> (ResolverConfig, ResolverOpts) {
+    let config = ResolverConfig::from_parts(
+        None,
+        vec![],
+        vec![NameServerConfig::udp_and_tcp(DOCKER_DNS.ip())],
+    );
+    let mut options = ResolverOpts::default();
+    options.ndots = 0;
+    (config, options)
 }
 
 fn build(
@@ -208,7 +244,6 @@ fn reply_source(server: SocketAddr, source: SocketAddr) -> SocketAddr {
 mod tests {
     use super::*;
     use hickory_resolver::Hosts;
-    use hickory_resolver::config::{NameServerConfig, ResolverConfig};
     use hickory_resolver::net::NoRecords;
     use hickory_resolver::proto::op::{Message, Query, ResponseCode};
     use hickory_resolver::proto::rr::{Name as DnsName, RData, Record, RecordType};
@@ -635,5 +670,44 @@ mod tests {
                     .is_err()
             );
         });
+    }
+
+    #[test]
+    fn unreadable_config_uses_only_dockers_local_resolver_inside_docker() {
+        let denied = || Err(io::Error::from(io::ErrorKind::PermissionDenied).into());
+        let (fallback, options) = docker_config();
+        assert_eq!(fallback.name_servers.len(), 1);
+        let server = &fallback.name_servers[0];
+        assert_eq!(server.ip, DOCKER_DNS.ip());
+        assert_eq!(server.connections.len(), 2);
+        assert!(
+            server
+                .connections
+                .iter()
+                .all(|connection| connection.port == 53)
+        );
+        use hickory_resolver::config::ProtocolConfig;
+        assert_eq!(server.connections[0].protocol, ProtocolConfig::Udp);
+        assert_eq!(server.connections[1].protocol, ProtocolConfig::Tcp);
+        assert_eq!(options.ndots, 0);
+        assert!(fallback.search.is_empty());
+
+        let mut builder = system_builder(denied(), true).unwrap();
+        assert_eq!(builder.options_mut().ndots, 0);
+        assert!(builder.build().is_ok());
+        assert!(system_builder(denied(), false).is_err());
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::InvalidData] {
+            let error = io::Error::from(kind);
+            assert!(system_builder(Err(error.into()), true).is_err());
+        }
+        assert!(system_builder(Err(NetError::Message("bad config")), true).is_err());
+
+        let config = config("192.0.2.53:5353".parse().unwrap(), true);
+        let mut options = ResolverOpts::default();
+        options.ndots = 3;
+        let original = DnsResolver::builder_with_config(config, DockerRuntime::default())
+            .with_options(options);
+        let mut builder = system_builder(Ok(original), true).unwrap();
+        assert_eq!(builder.options_mut().ndots, 3);
     }
 }

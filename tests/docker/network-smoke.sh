@@ -68,59 +68,76 @@ chmod 755 "$scratch"
 # This key is generated for this isolated test and discarded during cleanup.
 chmod 644 "$scratch/ca.crt" "$scratch/server.crt" "$scratch/server.key"
 
-docker image inspect "$image" >/dev/null
+image_user=$(docker image inspect --format '{{.Config.User}}' "$image")
+[[ $image_user == 65532:65532 ]]
 docker pull "$fixture_image"
 
 for driver in bridge macvlan; do
   for dns_mode in udp tcp-fallback; do
-    echo "Testing $driver network with $dns_mode DNS"
-    options=(--driver "$driver" --subnet 192.0.2.0/24 --gateway 192.0.2.1)
-    if [[ $driver == macvlan ]]; then
-      # A real parent keeps Docker's upstream DNS forwarding enabled. A
-      # parentless macvlan is internal and would not exercise that path.
-      "${ip_command[@]}" link add "$parent" type dummy
-      parent_created=true
-      "${ip_command[@]}" link set "$parent" up
-      options+=(-o "parent=$parent" -o macvlan_mode=bridge)
-    fi
-    docker network create "${options[@]}" "$network"
-    docker run --detach --name "$fixture" --init --read-only \
-      --cap-drop ALL --cap-add NET_BIND_SERVICE \
-      --network "$network" --ip 192.0.2.2 \
-      --network-alias api.ddns.test --network-alias auth.ddns.test \
-      --mount "type=bind,src=$fixture_dir,dst=/fixture,readonly" \
-      --mount "type=bind,src=$scratch,dst=/tls,readonly" \
-      --env PYTHONDONTWRITEBYTECODE=1 --env "DNS_MODE=$dns_mode" \
-      "$fixture_image" python -u /fixture/fixture.py serve
-    timeout 30s docker exec "$fixture" python /fixture/fixture.py wait
+    for config_mode in system unreadable; do
+      echo "Testing $driver network with $dns_mode DNS and $config_mode configuration"
+      options=(--driver "$driver" --subnet 192.0.2.0/24 --gateway 192.0.2.1)
+      if [[ $driver == macvlan ]]; then
+        # A real parent keeps Docker's upstream DNS forwarding enabled. A
+        # parentless macvlan is internal and would not exercise that path.
+        "${ip_command[@]}" link add "$parent" type dummy
+        parent_created=true
+        "${ip_command[@]}" link set "$parent" up
+        options+=(-o "parent=$parent" -o macvlan_mode=bridge)
+      fi
+      docker network create "${options[@]}" "$network"
+      docker run --detach --name "$fixture" --init --read-only \
+        --cap-drop ALL --cap-add NET_BIND_SERVICE \
+        --network "$network" --ip 192.0.2.2 \
+        --network-alias api.ddns.test --network-alias auth.ddns.test \
+        --mount "type=bind,src=$fixture_dir,dst=/fixture,readonly" \
+        --mount "type=bind,src=$scratch,dst=/tls,readonly" \
+        --env PYTHONDONTWRITEBYTECODE=1 --env "DNS_MODE=$dns_mode" \
+        "$fixture_image" python -u /fixture/fixture.py serve
+      timeout 30s docker exec "$fixture" python /fixture/fixture.py wait
 
-    # Only CI's upstream DNS points at the fixture. Docker still supplies
-    # 127.0.0.11 in resolv.conf; no resolv.conf override or host port is used.
-    docker create --name "$app" --init --read-only --cap-drop ALL \
-      --security-opt no-new-privileges:true --network "$network" --dns 192.0.2.2 \
-      --add-host hosts.ddns.test:203.0.113.30 \
-      --mount "type=bind,src=$scratch/ca.crt,dst=/ci-ca.crt,readonly" \
-      --env SSL_CERT_FILE=/ci-ca.crt --env SSL_CERT_DIR=/nonexistent \
-      --env TLS_ROOTS=native --env LOG_DIR= --env INTERVAL_SECONDS=0 \
-      --env RUN_ON_START=true --env DRY_RUN=false --env IPV6=false \
-      --env CONTABO_CLIENT_ID=ci --env CONTABO_CLIENT_SECRET=ci \
-      --env CONTABO_API_USER=ci@example.test --env CONTABO_API_PASSWORD=ci \
-      --env CONTABO_API_BASE=https://api.ddns.test:8443 \
-      --env CONTABO_AUTH_URL=https://auth.ddns.test:8443/token \
-      --env IP_ECHO_URL=https://echo.ddns.test:8443/ip \
-      --env IP_ECHO_TIMEOUT_SECONDS=10 --env DNS_RECORDS=home.example.test \
-      --env FIREWALL_ID=ci-firewall \
-      --env 'FIREWALL_RULES=[{"displayName":"DNS smoke","sources":["source.ddns.test","hosts.ddns.test"]}]' \
-      "$image"
-    docker start "$app"
-    status=$(timeout 90s docker wait "$app")
-    docker logs "$app"
-    [[ $status == 0 ]]
-    docker cp "$app:/etc/resolv.conf" "$scratch/resolv.conf"
-    cat "$scratch/resolv.conf"
-    awk '$1 == "nameserver" && $2 == "127.0.0.11" { found=1 } END { exit !found }' \
-      "$scratch/resolv.conf"
-    docker exec "$fixture" python /fixture/fixture.py assert
-    cleanup_case
+      # CI's upstream DNS points at the fixture. Docker configures its usual
+      # 127.0.0.11 stub; the unreadable case masks only its configuration file.
+      configuration_options=()
+      if [[ $config_mode == unreadable ]]; then
+        # Reproduce a resolver file that the image's uid 65532 cannot read.
+        # This CI-only mount does not change Docker's nameserver or forwarding.
+        printf 'nameserver 127.0.0.11\n' >"$scratch/unreadable-resolv.conf"
+        chmod 600 "$scratch/unreadable-resolv.conf"
+        configuration_options+=(--mount "type=bind,src=$scratch/unreadable-resolv.conf,dst=/etc/resolv.conf,readonly")
+      fi
+      docker create --name "$app" --init --read-only --cap-drop ALL "${configuration_options[@]}" \
+        --security-opt no-new-privileges:true --network "$network" --dns 192.0.2.2 \
+        --add-host hosts.ddns.test:203.0.113.30 \
+        --mount "type=bind,src=$scratch/ca.crt,dst=/ci-ca.crt,readonly" \
+        --env SSL_CERT_FILE=/ci-ca.crt --env SSL_CERT_DIR=/nonexistent \
+        --env TLS_ROOTS=native --env LOG_DIR= --env INTERVAL_SECONDS=0 \
+        --env RUN_ON_START=true --env DRY_RUN=false --env IPV6=false \
+        --env CONTABO_CLIENT_ID=ci --env CONTABO_CLIENT_SECRET=ci \
+        --env CONTABO_API_USER=ci@example.test --env CONTABO_API_PASSWORD=ci \
+        --env CONTABO_API_BASE=https://api.ddns.test:8443 \
+        --env CONTABO_AUTH_URL=https://auth.ddns.test:8443/token \
+        --env IP_ECHO_URL=https://echo.ddns.test:8443/ip \
+        --env IP_ECHO_TIMEOUT_SECONDS=10 --env DNS_RECORDS=home.example.test \
+        --env FIREWALL_ID=ci-firewall \
+        --env 'FIREWALL_RULES=[{"displayName":"DNS smoke","sources":["source.ddns.test","hosts.ddns.test"]}]' \
+        "$image"
+      docker start "$app"
+      status=$(timeout 90s docker wait "$app")
+      docker logs "$app"
+      [[ $status == 0 ]]
+      if [[ $config_mode == unreadable ]]; then
+        docker logs "$app" 2>&1 | awk '
+          /cannot read \/etc\/resolv.conf; using Docker DNS/ { found=1 }
+          END { exit !found }
+        '
+      fi
+      docker cp "$app:/etc/resolv.conf" "$scratch/resolv.conf"
+      cat "$scratch/resolv.conf"
+      awk '$1 == "nameserver" && $2 == "127.0.0.11" { found=1 } END { exit !found }' \
+        "$scratch/resolv.conf"
+      docker exec "$fixture" python /fixture/fixture.py assert
+      cleanup_case
+    done
   done
 done

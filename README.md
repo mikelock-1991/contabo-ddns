@@ -50,6 +50,8 @@ Podman uses the same file: `podman compose up -d`. Log in to `ghcr.io` first whe
 
 DNS lookups use Hickory inside the binary, bypassing musl's resolver. The program follows the system DNS configuration and `/etc/hosts`, including Docker's `127.0.0.11` on user-defined networks such as macvlan. It uses UDP with TCP fallback. For queries to `127.0.0.11:53` only, replies from another port on that same IP are accepted; query IDs, questions, and DNS records are still checked. Other DNS servers retain strict source address and port checks. No Compose DNS override or mounted `resolv.conf` is needed.
 
+On a Docker user-defined network, if `/etc/resolv.conf` is unreadable by uid 65532, the program logs a warning and uses Docker's local resolver at `127.0.0.11:53`. This keeps nonroot containers working without adding capabilities or changing Compose. Search domains cannot be recovered from an unreadable file, so use full hostnames in that case. Missing or malformed DNS configuration, and permission errors outside Docker, still fail startup. No public DNS service is used as a fallback.
+
 That Compose healthcheck runs `contabo-ddns health` every 30 seconds. Inside the container that is `GET /health` on `127.0.0.1:8080`, and the body `ok` means healthy. Do not publish the port. `HEALTHCHECK_BIND` can select another loopback address. Any other address is rejected. After the 15 second start period, `docker compose ps` shows `healthy`.
 
 Follow the log with `docker compose logs -f`.
@@ -242,7 +244,7 @@ cargo check-fmt
 cargo lint
 ```
 
-The Docker CI job loads the production image and runs it on user-defined bridge and macvlan networks on both amd64 and arm64. Each network is tested with UDP DNS and with truncated UDP replies that require TCP fallback. Local DNS and HTTPS fixtures verify Docker service aliases, upstream A/AAAA resolution, `/etc/hosts`, and the resulting DNS and firewall updates. The test checks that the container uses `127.0.0.11`; it uses dummy credentials and never contacts Contabo.
+The Docker CI job loads the production image and runs it on user-defined bridge and macvlan networks on both amd64 and arm64. Each network is tested with UDP DNS and with truncated UDP replies that require TCP fallback, using both the normal resolver configuration and a file that uid 65532 cannot read. Local DNS and HTTPS fixtures verify Docker service aliases, upstream A/AAAA resolution, `/etc/hosts`, and the resulting DNS and firewall updates. The test checks that the container uses `127.0.0.11`; it uses dummy credentials and never contacts Contabo.
 
 To run the same smoke test on a rootful Linux Docker host, build the image and run:
 
