@@ -869,6 +869,7 @@ mod tests {
 
     #[test]
     fn accept_classification_stops_on_shutdown_and_errors() {
+        crate::logsetup::discard_output();
         let stop = AtomicBool::new(true);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();

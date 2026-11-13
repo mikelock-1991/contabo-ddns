@@ -147,6 +147,8 @@ pub fn token_route() -> (&'static str, &'static str, u16, String) {
 
 /// API client against the `example.test` endpoints with fixed test credentials.
 pub fn client(http: &dyn Http) -> ContaboClient<'_> {
+    // Enable log arguments before exercising API paths, regardless of test order.
+    crate::logsetup::discard_output();
     ContaboClient::new(
         http,
         "https://api.example.test",
