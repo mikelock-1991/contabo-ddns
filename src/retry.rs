@@ -99,6 +99,7 @@ mod tests {
         shutdown: &AtomicBool,
         mut next: impl FnMut() -> Result<HttpResponse, Error>,
     ) -> (Result<HttpResponse, Error>, u32) {
+        crate::logsetup::discard_output();
         let mut attempts = 0;
         let result = send("GET /test", idempotent, shutdown, immediate, || {
             attempts += 1;
