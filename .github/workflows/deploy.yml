@@ -310,7 +310,9 @@ jobs:
             -t "docker.io/${DOCKERHUB_USERNAME}/contabo-ddns:${VERSION}" \
             "${hub_sources[@]}"
           index_digest() {
-            docker buildx imagetools inspect "$1" | awk '/^Digest:/ { print $2; exit }'
+            # Consume the full response: an early reader exit can break Docker's
+            # output pipe and fail this step under pipefail after a successful push.
+            docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | jq -er '.digest'
           }
           ghcr_ref="ghcr.io/${REPO_LC}:${VERSION}"
           hub_ref="docker.io/${DOCKERHUB_USERNAME}/contabo-ddns:${VERSION}"
@@ -325,7 +327,7 @@ jobs:
           for ref in "$ghcr_ref" "$hub_ref"; do
             platforms="$(docker buildx imagetools inspect "$ref")"
             printf '%s\n' "$platforms"
-            if ! printf '%s\n' "$platforms" | grep -q 'linux/amd64' || ! printf '%s\n' "$platforms" | grep -q 'linux/arm64'; then
+            if ! grep -q 'linux/amd64' <<<"$platforms" || ! grep -q 'linux/arm64' <<<"$platforms"; then
               echo "::error::${ref} is missing linux/amd64 or linux/arm64"
               exit 1
             fi
